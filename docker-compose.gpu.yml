@@ -1,0 +1,92 @@
+services:
+  reconstruction-worker-nerfstudio-gpu:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.nerfstudio
+    container_name: reconstruction-worker-nerfstudio-gpu
+    env_file:
+      - .env.example
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
+      SKIP_INSTANTSPLATPP_EXTENSION_BUILD: "1"
+      TORCH_HOME: /app/models/dynamic/torch
+    depends_on:
+      - redis
+      - postgres
+      - minio
+    volumes:
+      - ./data:/app/data
+      - ./configs:/app/configs
+      - ./workspace:/workspace
+      - ./external/InstantSplatPP:/opt/InstantSplatPP
+      - ./external/mast3r:/opt/mast3r
+      - ./external/gaussian-splatting:/opt/gaussian-splatting
+      - ./external/splat-transform:/opt/splat-transform
+      - ./external/sam2:/opt/sam2
+      - ./external/GroundingDINO:/opt/GroundingDINO
+      - ./external/Grounded-SAM-2:/opt/Grounded-SAM-2
+      - ./external/LightGlue:/opt/LightGlue
+      - ./external/ALIKED:/opt/ALIKED
+      - ./external/spz:/opt/spz
+      - ./external/3DGS-PLY-3DTiles-Converter:/opt/3DGS-PLY-3DTiles-Converter
+      - ./external/3d-tiles-tools:/opt/3d-tiles-tools
+      - ./models:/app/models
+    shm_size: "16gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      gpu-worker-entrypoint
+      celery -A app.workers.celery_app worker
+      --loglevel=info
+      --queues=gpu,nerfstudio
+      --concurrency=1
+
+  reconstruction-worker-gpu:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.nerfstudio
+    container_name: reconstruction-worker-gpu
+    env_file:
+      - .env.example
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
+      TORCH_HOME: /app/models/dynamic/torch
+    depends_on:
+      - redis
+      - postgres
+      - minio
+    volumes:
+      - ./data:/app/data
+      - ./configs:/app/configs
+      - ./external/InstantSplatPP:/opt/InstantSplatPP
+      - ./external/mast3r:/opt/mast3r
+      - ./external/gaussian-splatting:/opt/gaussian-splatting
+      - ./external/splat-transform:/opt/splat-transform
+      - ./external/sam2:/opt/sam2
+      - ./external/GroundingDINO:/opt/GroundingDINO
+      - ./external/Grounded-SAM-2:/opt/Grounded-SAM-2
+      - ./external/LightGlue:/opt/LightGlue
+      - ./external/ALIKED:/opt/ALIKED
+      - ./external/spz:/opt/spz
+      - ./external/3DGS-PLY-3DTiles-Converter:/opt/3DGS-PLY-3DTiles-Converter
+      - ./external/3d-tiles-tools:/opt/3d-tiles-tools
+      - ./models:/app/models
+      - ./workspace:/workspace
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      gpu-worker-entrypoint
+      celery -A app.workers.celery_app worker
+      --loglevel=info
+      --queues=gpu,instantsplatpp,gaussian
+      --concurrency=1

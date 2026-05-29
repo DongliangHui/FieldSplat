@@ -1,0 +1,22 @@
+input_policy:
+  forbid_mixed_raw_images_dataset: true
+  forbid_unregistered_detail_photos_in_global_pose: true
+  forbid_pano_crops_as_independent_real_cameras: true
+  forbid_vsr_images_for_pose_solving: true
+
+training_policy:
+  forbid_single_global_ply_for_large_scene: true
+  require_pose_gate_before_high_quality_train: true
+  require_holdout_render_gate: true
+
+quality_policy:
+  forbid_min_ply_bytes_as_quality_only: true
+  require_connected_component_gate: true
+  require_viewer_load_gate: true
+  block_dynamic_objects_in_static_3dgs: true
+
+export_policy:
+  require_scene_manifest: true
+  require_diagnostics_bundle: true
+  require_viewer_asset: true
+  raw_ply_is_not_final_product: true

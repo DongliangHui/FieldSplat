@@ -1,0 +1,29 @@
+FROM python:3.12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/backend \
+    WORKSPACE_ROOT=/workspace
+
+ARG NODE_VERSION=22.22.3
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg libgl1 libglib2.0-0 curl ca-certificates xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" -o /tmp/node.tar.xz \
+    && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
+    && rm -f /tmp/node.tar.xz \
+    && node --version \
+    && npm --version
+
+COPY backend/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+COPY backend /app/backend
+WORKDIR /app/backend
+
+RUN mkdir -p /workspace

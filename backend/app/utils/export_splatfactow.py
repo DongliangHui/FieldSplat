@@ -1,0 +1,144 @@
+from __future__ import annotations
+
+import argparse
+from collections import OrderedDict
+from importlib.metadata import version
+from pathlib import Path
+from typing import Any
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Export a Splatfacto-W Nerfstudio checkpoint to Gaussian Splat PLY.")
+    parser.add_argument("--load-config", required=True, type=Path)
+    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--output-filename", default="splat.ply")
+    parser.add_argument("--camera-index", default=0, type=int)
+    parser.add_argument("--ply-color-mode", default="sh_coeffs", choices=["sh_coeffs", "rgb"])
+    args = parser.parse_args()
+    export_splatfactow(
+        load_config=args.load_config,
+        output_dir=args.output_dir,
+        output_filename=args.output_filename,
+        camera_index=args.camera_index,
+        ply_color_mode=args.ply_color_mode,
+    )
+
+
+def export_splatfactow(
+    *,
+    load_config: Path,
+    output_dir: Path,
+    output_filename: str = "splat.ply",
+    camera_index: int = 0,
+    ply_color_mode: str = "sh_coeffs",
+) -> Path:
+    import numpy as np
+    import torch
+    from nerfstudio.utils.eval_utils import eval_setup
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _, pipeline, _, _ = eval_setup(load_config, test_mode="inference")
+    model = pipeline.model
+    if hasattr(model, "set_camera_idx"):
+        model.set_camera_idx(int(camera_index))
+
+    filename = output_dir / output_filename
+    tensors: OrderedDict[str, Any] = OrderedDict()
+    with torch.no_grad():
+        positions = model.means.detach().cpu().numpy()
+        count = int(positions.shape[0])
+        tensors["x"] = positions[:, 0]
+        tensors["y"] = positions[:, 1]
+        tensors["z"] = positions[:, 2]
+        tensors["nx"] = np.zeros(count, dtype=np.float32)
+        tensors["ny"] = np.zeros(count, dtype=np.float32)
+        tensors["nz"] = np.zeros(count, dtype=np.float32)
+
+        if ply_color_mode == "rgb":
+            colors = _model_rgb_colors(model).detach()
+            colors = torch.clamp(colors, 0.0, 1.0).cpu().numpy()
+            colors = (colors * 255).astype(np.uint8)
+            tensors["red"] = colors[:, 0]
+            tensors["green"] = colors[:, 1]
+            tensors["blue"] = colors[:, 2]
+        else:
+            shs_0 = model.shs_0.contiguous().detach().cpu().numpy()
+            if shs_0.ndim == 3:
+                shs_0 = shs_0[:, 0, :]
+            for index in range(shs_0.shape[1]):
+                tensors[f"f_dc_{index}"] = shs_0[:, index, None]
+            sh_degree = int(getattr(getattr(model, "config", None), "sh_degree", 0) or 0)
+            if sh_degree > 0:
+                shs_rest = model.shs_rest.transpose(1, 2).contiguous().detach().cpu().numpy()
+                shs_rest = shs_rest.reshape((count, -1))
+                for index in range(shs_rest.shape[-1]):
+                    tensors[f"f_rest_{index}"] = shs_rest[:, index, None]
+
+        tensors["opacity"] = model.opacities.detach().cpu().numpy()
+        scales = model.scales.detach().cpu().numpy()
+        for index in range(3):
+            tensors[f"scale_{index}"] = scales[:, index, None]
+        quats = model.quats.detach().cpu().numpy()
+        for index in range(4):
+            tensors[f"rot_{index}"] = quats[:, index, None]
+
+    tensors, count = _finite_and_visible_gaussians(tensors)
+    _write_ply(filename, count, tensors)
+    print(f"Exported {count} gaussians to {filename}")
+    return filename
+
+
+def _model_rgb_colors(model: Any):
+    if hasattr(model, "colors"):
+        return model.colors
+    if hasattr(model, "base_colors"):
+        return model.base_colors
+    raise RuntimeError("Splatfacto-W export could not find model colors/base_colors")
+
+
+def _finite_and_visible_gaussians(tensors: OrderedDict[str, Any]) -> tuple[OrderedDict[str, Any], int]:
+    import numpy as np
+
+    first = next(iter(tensors.values()))
+    count = int(first.shape[0])
+    select = np.ones(count, dtype=bool)
+    for tensor in tensors.values():
+        select = np.logical_and(select, np.isfinite(tensor).all(axis=-1))
+    low_opacity = tensors["opacity"].squeeze(axis=-1) < -5.5373
+    select[low_opacity] = False
+    if np.sum(select) == count:
+        return tensors, count
+    filtered: OrderedDict[str, Any] = OrderedDict()
+    for key, tensor in tensors.items():
+        filtered[key] = tensor[select]
+    return filtered, int(np.sum(select))
+
+
+def _write_ply(filename: Path, count: int, tensors: OrderedDict[str, Any]) -> None:
+    import numpy as np
+
+    if count <= 0:
+        raise RuntimeError("Refusing to export an empty Gaussian PLY")
+    if not all(tensor.size == count for tensor in tensors.values()):
+        raise ValueError("Count does not match tensor lengths")
+    with filename.open("wb") as ply_file:
+        ply_file.write(b"ply\n")
+        ply_file.write(b"format binary_little_endian 1.0\n")
+        ply_file.write(f"comment Generated by FieldSplat Splatfacto-W exporter using Nerfstudio {version('nerfstudio')}\n".encode())
+        ply_file.write(b"comment Vertical Axis: z\n")
+        ply_file.write(f"element vertex {count}\n".encode())
+        for key, tensor in tensors.items():
+            data_type = "float" if tensor.dtype.kind == "f" else "uchar"
+            ply_file.write(f"property {data_type} {key}\n".encode())
+        ply_file.write(b"end_header\n")
+        for index in range(count):
+            for tensor in tensors.values():
+                value = tensor[index]
+                if tensor.dtype.kind == "f":
+                    ply_file.write(np.float32(value).tobytes())
+                elif tensor.dtype == np.uint8:
+                    ply_file.write(value.tobytes())
+
+
+if __name__ == "__main__":
+    main()

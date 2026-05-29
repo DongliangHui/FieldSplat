@@ -1,0 +1,119 @@
+services:
+  reconstruction-api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: reconstruction-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.example
+    environment:
+      HOST_IMPORT_ROOT: ${HOST_IMPORT_ROOT:-./samples}
+      HOST_IMPORT_CONTAINER_ROOT: /host-imports
+    depends_on:
+      - postgres
+      - redis
+      - minio
+    volumes:
+      - ./data:/app/data
+      - ./configs:/app/configs
+      - ./workspace:/workspace
+      - ${HOST_IMPORT_ROOT:-./samples}:/host-imports:ro
+    command: >
+      uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  reconstruction-worker-cpu:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker.cpu
+    container_name: reconstruction-worker-cpu
+    env_file:
+      - .env.example
+    depends_on:
+      - reconstruction-api
+      - redis
+      - postgres
+      - minio
+    volumes:
+      - ./data:/app/data
+      - ./configs:/app/configs
+      - ./workspace:/workspace
+      - ./external/splat-transform:/opt/splat-transform
+      - ./external/spz:/opt/spz
+      - ./external/3DGS-PLY-3DTiles-Converter:/opt/3DGS-PLY-3DTiles-Converter
+      - ./external/3d-tiles-tools:/opt/3d-tiles-tools
+    command: >
+      celery -A app.workers.celery_app worker
+      --loglevel=info
+      --queues=default,cpu,preprocess,qc,export
+
+  reconstruction-worker-colmap:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: reconstruction-worker-colmap
+    env_file:
+      - .env.example
+    depends_on:
+      - redis
+      - postgres
+      - minio
+    volumes:
+      - ./data:/app/data
+      - ./configs:/app/configs
+      - ./workspace:/workspace
+    command: >
+      celery -A app.workers.celery_app worker
+      --loglevel=info
+      --queues=colmap
+
+  postgres:
+    image: postgres:16
+    container_name: reconstruction-postgres
+    environment:
+      POSTGRES_USER: reconstruction
+      POSTGRES_PASSWORD: reconstruction
+      POSTGRES_DB: reconstruction
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7
+    container_name: reconstruction-redis
+    ports:
+      - "6379:6379"
+
+  minio:
+    image: minio/minio
+    container_name: reconstruction-minio
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123456
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    command: server /data --console-address ":9001"
+
+  reconstruction-console:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    container_name: reconstruction-console
+    ports:
+      - "3000:80"
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000/api/v1
+      VITE_SAMPLE_PHOTO_PATH: ${VITE_SAMPLE_PHOTO_PATH:-/host-imports/ai_sample/pic}
+      VITE_SAMPLE_VIDEO_PATH: ${VITE_SAMPLE_VIDEO_PATH:-/host-imports/good/south-building-good.mp4}
+      VITE_INTERNAL_CONSOLE_TOKEN: ${INTERNAL_CONSOLE_API_TOKEN:-change-me-console-token}
+    depends_on:
+      - reconstruction-api
+
+volumes:
+  postgres_data:
+  minio_data:
