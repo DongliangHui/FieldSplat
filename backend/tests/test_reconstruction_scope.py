@@ -19,7 +19,7 @@ reconstruction_scope:
   reconstruction_scope: roi_first
   foreground_ratio: 0.6
   preserve_context: true
-  publish_default: subject_model
+  publish_default: raw_model
   viewer_max_gaussians: 5
 """,
         encoding="utf-8",
@@ -86,16 +86,25 @@ def test_scope_operators_create_mask_spatial_crop_and_layered_models(tmp_path: P
         gaussian_quality={"passed": True, "vertex_count": 20},
     )
     assert pruning.report["passed"] is True
-    assert pruning.report["publish_default"] == "subject_model"
+    assert pruning.report["publish_default"] == "raw_model"
     assert pruning.report["source_gaussian_count"] == 20
+    assert pruning.report["raw_gaussian_count"] == 20
     assert pruning.report["subject_gaussian_count"] == 12
     assert pruning.report["viewer_default"] == "viewer_model"
     assert pruning.report["viewer_gaussian_count"] == 4
+    assert pruning.report["viewer_model_role"] == "preview_proxy"
+    assert pruning.report["quality_model_not_capped_for_viewer"] is True
     assert pruning.outputs["subject_model"].exists()
+    assert pruning.outputs["raw_model"].exists()
     assert pruning.outputs["viewer_model"].exists()
     assert pruning.outputs["context_model_lowres"].exists()
     assert pruning.outputs["full_model_debug"].exists()
+    assert "element vertex 20" in pruning.outputs["raw_model"].read_text(encoding="utf-8")
     assert "element vertex 4" in pruning.outputs["viewer_model"].read_text(encoding="utf-8")
+    layers = {layer["id"]: layer for layer in pruning.report["layered_loading"]["layers"]}
+    assert layers["raw_model"]["gaussian_count"] == 20
+    assert layers["viewer_model"]["gaussian_count"] == 4
+    assert layers["viewer_model"]["role"] == "interactive_preview"
 
 
 def test_scope_operator_reuses_configured_external_mask_manifest(tmp_path: Path) -> None:

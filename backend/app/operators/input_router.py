@@ -70,6 +70,7 @@ class InputRouterOperator:
             "route_id": route_id,
             "route_key": route_key,
             "route_reason": route_reason,
+            **_route_policy(route_key, route_reason),
             "input_classification": input_classification,
             "policy": {
                 "forbid_mixed_raw_images_dataset": True,
@@ -133,13 +134,17 @@ def _select_route(workflow: Workflow, buckets: dict[str, list[Asset]], settings:
     if global_video_count:
         return "colmap_splatfacto", "route_001_colmap_splatfacto", "global_video_requires_keyframes_colmap"
     if 0 < global_count <= 12:
-        return "instantsplatpp_sparse_local", "route_004_instantsplatpp_sparse_local", "few_global_photo_inputs"
+        if _allow_instantsplatpp_preview_route(workflow, settings):
+            return "instantsplatpp_sparse_local", "route_004_instantsplatpp_sparse_local", "few_global_photo_inputs_preview_opt_in"
+        return "colmap_splatfacto", "route_001_colmap_splatfacto", "few_global_photo_inputs_colmap_guarded"
     scene_enable = default_at("scene_partition.enable_if", {}, settings=settings)
     image_threshold = int((scene_enable if isinstance(scene_enable, dict) else {}).get("image_count_gt", 800))
     if global_count > image_threshold:
         return "colmap_chunked_splatfacto", "route_002_colmap_splatfacto_chunked", "large_global_input_count"
     if not global_count and detail_count:
-        return "instantsplatpp_sparse_local", "route_004_instantsplatpp_sparse_local", "detail_only_sparse_inputs"
+        if _allow_instantsplatpp_fallback_route(workflow, settings):
+            return "instantsplatpp_sparse_local", "route_004_instantsplatpp_sparse_local", "detail_only_sparse_inputs_fallback_opt_in"
+        return "colmap_splatfacto", "route_001_colmap_splatfacto", "detail_only_inputs_require_global_registration"
     if supplement_count and global_count:
         return "colmap_splatfacto", "route_001_colmap_splatfacto", "supplement_inputs_deferred_to_issue_fusion"
     return "colmap_splatfacto", "route_001_colmap_splatfacto", "standard_static_reconstruction"
@@ -154,6 +159,57 @@ def _route_id(route_key: str) -> str:
         "pano_anchor_export": "route_005_pano_anchor_export",
         "supplement_detail_fusion": "route_006_supplement_detail_fusion",
     }.get(route_key, route_key)
+
+
+def _route_policy(route_key: str, route_reason: str) -> dict[str, Any]:
+    if route_key == "instantsplatpp_sparse_local":
+        route_role = "fallback" if "fallback" in route_reason else "preview"
+        return {
+            "route_role": route_role,
+            "production_allowed": False,
+            "measurement_allowed": False,
+            "experimental": True,
+            "requires_feature_flag": True,
+        }
+    return {
+        "route_role": "production",
+        "production_allowed": True,
+        "measurement_allowed": False,
+        "experimental": False,
+        "requires_feature_flag": False,
+    }
+
+
+def _allow_instantsplatpp_preview_route(workflow: Workflow, settings: Settings | None = None) -> bool:
+    config = workflow.config_json or {}
+    return bool(
+        _routing_flag(config, settings, "allow_instantsplatpp_preview_route")
+        or _routing_flag(config, settings, "enable_instantsplatpp_direct_route")
+        or config.get("preview_method") == "instantsplatpp"
+        or config.get("detail_method") == "instantsplatpp"
+    )
+
+
+def _allow_instantsplatpp_fallback_route(workflow: Workflow, settings: Settings | None = None) -> bool:
+    config = workflow.config_json or {}
+    return bool(
+        _routing_flag(config, settings, "allow_instantsplatpp_fallback_route")
+        or config.get("fallback_method") == "instantsplatpp"
+        or config.get("detail_method") == "instantsplatpp"
+    )
+
+
+def _routing_flag(config: dict[str, Any], settings: Settings | None, key: str) -> bool:
+    for source in (
+        ((config.get("algorithm") or {}).get("routing") if isinstance(config.get("algorithm"), dict) else None),
+        config.get("routing") if isinstance(config.get("routing"), dict) else None,
+    ):
+        if isinstance(source, dict) and key in source:
+            return bool(source.get(key))
+    engine = (settings or get_settings()).engine_config
+    algorithm = engine.get("algorithm") if isinstance(engine, dict) else None
+    routing = algorithm.get("routing") if isinstance(algorithm, dict) else None
+    return bool(routing.get(key)) if isinstance(routing, dict) else False
 
 
 def _asset_ref(asset: Asset, **extra: Any) -> dict[str, Any]:

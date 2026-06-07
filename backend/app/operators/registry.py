@@ -389,7 +389,7 @@ def operator_health() -> dict[str, dict[str, Any]]:
             "enabled": bool(gaussian_pruning.get("enabled", True)),
             "available": True,
             "queue": gaussian_pruning.get("queue", "export"),
-            "outputs": ["subject_model", "viewer_model", "context_model_lowres", "full_model_debug", "gaussian_pruning_report"],
+            "outputs": ["raw_model", "subject_model", "viewer_model", "context_model_lowres", "full_model_debug", "gaussian_pruning_report"],
         },
         "export.raw_ply": {"enabled": True, "available": True, "queue": "export"},
         "export.optimized_viewer_asset": {

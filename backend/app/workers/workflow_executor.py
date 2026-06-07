@@ -651,7 +651,13 @@ def _register_input_routing_manifest(
         relative_path=f"projects/{workflow.project_id}/runs/{workflow.id}/artifacts/input_routing_manifest.json",
         source_path=str(routing.manifest_path),
         mime_type="application/json",
-        metadata={"route_id": routing.route_id, "route_key": routing.route_key},
+        metadata={
+            "route_id": routing.route_id,
+            "route_key": routing.route_key,
+            "route_role": routing.manifest.get("route_role"),
+            "production_allowed": routing.manifest.get("production_allowed"),
+            "measurement_allowed": routing.manifest.get("measurement_allowed"),
+        },
     ).id
 
 
@@ -903,17 +909,20 @@ def _register_spatial_crop_artifact(workflow: Workflow, artifact_service: Artifa
 def _register_gaussian_pruning_artifacts(workflow: Workflow, artifact_service: ArtifactService, result: GaussianPruningResult) -> list[str]:
     specs = [
         ("gaussian_pruning_report", "gaussian_pruning_report.json", result.report_path, "application/json", False),
+        ("raw_model", "raw_model.ply", result.outputs.get("raw_model"), "application/octet-stream", False),
         ("model_full", "model_full.ply", result.outputs.get("model_full"), "application/octet-stream", False),
         ("model_roi", "model_roi.ply", result.outputs.get("model_roi"), "application/octet-stream", False),
-        ("subject_model", "subject_model.ply", result.outputs.get("subject_model"), "application/octet-stream", True),
+        ("subject_model", "subject_model.ply", result.outputs.get("subject_model"), "application/octet-stream", False),
         ("viewer_model", "viewer_model.ply", result.outputs.get("viewer_model"), "application/octet-stream", False),
         ("context_model_lowres", "context_model_lowres.ply", result.outputs.get("context_model_lowres"), "application/octet-stream", False),
         ("full_model_debug", "full_model_debug.ply", result.outputs.get("full_model_debug"), "application/octet-stream", False),
     ]
+    publish_default = str(result.report.get("publish_default") or "raw_model")
     registered: list[str] = []
     for artifact_type, filename, path, mime_type, is_primary in specs:
         if path is None or not Path(path).exists():
             continue
+        primary = bool(is_primary or artifact_type == publish_default)
         registered.append(
             artifact_service.register_file(
                 project_id=workflow.project_id,
@@ -923,14 +932,16 @@ def _register_gaussian_pruning_artifacts(workflow: Workflow, artifact_service: A
                 relative_path=f"projects/{workflow.project_id}/runs/{workflow.id}/artifacts/{filename}",
                 source_path=str(path),
                 mime_type=mime_type,
-                is_primary=is_primary,
-                viewer_url=f"/api/v1/workflows/{workflow.id}/viewer" if artifact_type in {"subject_model", "viewer_model"} else None,
+                is_primary=primary,
+                viewer_url=f"/api/v1/workflows/{workflow.id}/viewer" if artifact_type == "viewer_model" else None,
                 metadata={
                     "operator": "scope.gaussian_pruning",
                     "publish_default": result.report.get("publish_default"),
                     "viewer_default": result.report.get("viewer_default"),
                     "foreground_ratio": result.report.get("foreground_ratio"),
-                    "raw_ply_is_final_product": False,
+                    "raw_ply_is_final_product": artifact_type in {"raw_model", "model_full"},
+                    "viewer_model_role": result.report.get("viewer_model_role"),
+                    "quality_model_not_capped_for_viewer": result.report.get("quality_model_not_capped_for_viewer"),
                 },
             ).id
         )
@@ -974,7 +985,11 @@ def _register_export_artifacts(
                 mime_type=mime_type,
                 is_primary=artifact_type == "subject_model",
                 viewer_url=f"/api/v1/workflows/{workflow.id}/viewer" if artifact_type in {"optimized_viewer_asset", "subject_model"} else None,
-                metadata={"raw_ply_is_final_product": False} if artifact_type in {"raw_ply", "optimized_viewer_asset", "spz_asset", "subject_model"} else {},
+                metadata=(
+                    {"raw_ply_is_final_product": artifact_type == "raw_ply"}
+                    if artifact_type in {"raw_ply", "optimized_viewer_asset", "spz_asset", "subject_model"}
+                    else {}
+                ),
             ).id
         )
     return registered
@@ -1402,6 +1417,9 @@ def _run_comparison_workflow(db: Session, workflow: Workflow, artifact_service: 
             "pano_inputs_count": len(routing.pano_inputs),
             "supplement_inputs_count": len(routing.supplement_inputs),
             "scale_inputs_count": len(routing.scale_inputs),
+            "route_role": routing.manifest.get("route_role"),
+            "production_allowed": routing.manifest.get("production_allowed"),
+            "measurement_allowed": routing.manifest.get("measurement_allowed"),
         },
     )
     routes = _comparison_routes(routing)
@@ -1512,8 +1530,11 @@ def _comparison_routes(routing: InputRoutingResult) -> list[dict[str, Any]]:
         {
             "route_key": "instantsplatpp_sparse_local",
             "route_id": "route_004_instantsplatpp_sparse_local",
-            "score": 0.8 if 0 < global_count <= 12 or (not global_count and detail_count) else 0.3,
+            "score": 0.45 if 0 < global_count <= 12 or (not global_count and detail_count) else 0.3,
             "trigger": "few_images_or_detail_block" if 0 < global_count <= 12 or (not global_count and detail_count) else "not_triggered",
+            "route_role": "preview",
+            "production_allowed": False,
+            "measurement_allowed": False,
         },
     ]
     return routes
@@ -2432,8 +2453,7 @@ def _should_try_instantsplatpp(
         return True
     if camera_quality and not camera_quality.get("passed", True) and fallback in {"instantsplatpp", "auto"}:
         return True
-    image_count = len(preprocess.image_paths)
-    return 0 < image_count <= 12
+    return False
 
 
 def _mast3r_payload(result: Mast3rSfmRunResult, trigger_reason: str) -> dict[str, Any]:
@@ -2626,7 +2646,7 @@ def _run_instantsplatpp_fallback(
         diagnostics={"camera_mapping": camera_check, "gaussian_quality": gaussian_eval, "render_quality": render_quality},
     )
     export_cache_hit = bool(export_result.get("cache_hit"))
-    update_stage(db, workflow, "export_raw_ply", status="succeeded", progress=1.0, output_summary=_background_summary({"raw_ply_is_final_product": False}, cache_hit=export_cache_hit))
+    update_stage(db, workflow, "export_raw_ply", status="succeeded", progress=1.0, output_summary=_background_summary({"raw_ply_is_final_product": True}, cache_hit=export_cache_hit))
     update_stage(db, workflow, "thumbnail_generation", status="succeeded", progress=1.0, output_summary=_background_summary({"source": "viewer_asset", "generated": False, "reason": "thumbnail_generation_runs_as_background_hook"}, cache_hit=export_cache_hit))
     update_stage(
         db,
@@ -2904,6 +2924,9 @@ def _run_nerfstudio(db: Session, workflow: Workflow, artifact_service: ArtifactS
             "supplement_inputs_count": len(routing.supplement_inputs),
             "scale_inputs_count": len(routing.scale_inputs),
             "excluded_inputs_count": len(routing.excluded_inputs),
+            "route_role": routing.manifest.get("route_role"),
+            "production_allowed": routing.manifest.get("production_allowed"),
+            "measurement_allowed": routing.manifest.get("measurement_allowed"),
         },
         log_message=f"input.route selected {routing.route_id}",
     )
@@ -3527,9 +3550,11 @@ def _run_nerfstudio(db: Session, workflow: Workflow, artifact_service: ArtifactS
             "subject_gaussian_count": gaussian_pruning.report.get("subject_gaussian_count"),
             "viewer_gaussian_count": gaussian_pruning.report.get("viewer_gaussian_count"),
             "context_gaussian_count": gaussian_pruning.report.get("context_gaussian_count"),
+            "raw_model_size": gaussian_pruning.report.get("raw_model_size"),
             "final_subject_model_size": gaussian_pruning.report.get("final_subject_model_size"),
             "viewer_model_size": gaussian_pruning.report.get("viewer_model_size"),
             "context_model_size": gaussian_pruning.report.get("context_model_size"),
+            "layered_loading": gaussian_pruning.report.get("layered_loading"),
             "cache_hit": gaussian_pruning.cache_hit,
         },
         error_message=None if gaussian_pruning.report.get("passed") else str(gaussian_pruning.report.get("reason") or "gaussian_pruning_failed"),
@@ -3685,6 +3710,8 @@ def _run_nerfstudio(db: Session, workflow: Workflow, artifact_service: ArtifactS
                 "mask_manifest": subject_mask.manifest_path,
                 "spatial_crop_manifest": spatial_crop.manifest_path,
                 "gaussian_pruning_report": gaussian_pruning.report_path,
+                "raw_model": gaussian_pruning.outputs.get("raw_model"),
+                "model_full": gaussian_pruning.outputs.get("model_full"),
                 "subject_model": forensic_boost_result.outputs.get("full_scene_high_quality") if forensic_boost_result else gaussian_pruning.outputs.get("subject_model"),
                 "viewer_model": forensic_boost_result.outputs.get("full_scene_high_quality") if forensic_boost_result else gaussian_pruning.outputs.get("viewer_model"),
                 "full_scene_high_quality": forensic_boost_result.outputs.get("full_scene_high_quality") if forensic_boost_result else None,
@@ -3695,7 +3722,7 @@ def _run_nerfstudio(db: Session, workflow: Workflow, artifact_service: ArtifactS
         },
     )
     export_cache_hit = bool(export_result.get("cache_hit"))
-    update_stage(db, workflow, "export_raw_ply", status="succeeded", progress=1.0, output_summary=_background_summary({"raw_ply_is_final_product": False}, cache_hit=export_cache_hit))
+    update_stage(db, workflow, "export_raw_ply", status="succeeded", progress=1.0, output_summary=_background_summary({"raw_ply_is_final_product": True}, cache_hit=export_cache_hit))
     update_stage(db, workflow, "thumbnail_generation", status="succeeded", progress=1.0, output_summary=_background_summary({"source": "viewer_asset", "generated": False, "reason": "thumbnail_generation_runs_as_background_hook"}, cache_hit=export_cache_hit))
     update_stage(
         db,

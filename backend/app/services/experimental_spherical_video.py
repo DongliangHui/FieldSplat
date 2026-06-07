@@ -25,6 +25,9 @@ class SphericalVideoExperimentConfig:
     output_height: int = 900
 
 
+SPHERICAL_RIG_VIEW_SOURCE_TYPES = {"spherical_video_keyframe_view", "panorama_station_view"}
+
+
 def spherical_video_config(config: dict[str, Any]) -> SphericalVideoExperimentConfig:
     raw = config.get("experimental_360_video")
     if not isinstance(raw, dict):
@@ -180,7 +183,7 @@ def spherical_frame_key(entry: dict[str, Any]) -> tuple[int, str]:
 def group_spherical_entries_by_stream(entries: list[dict[str, Any]]) -> dict[tuple[float, float], list[dict[str, Any]]]:
     groups: dict[tuple[float, float], list[dict[str, Any]]] = {}
     for entry in entries:
-        if entry.get("source_type") != "spherical_video_keyframe_view":
+        if entry.get("source_type") not in SPHERICAL_RIG_VIEW_SOURCE_TYPES:
             continue
         if entry.get("pose_image") is None:
             continue

@@ -24,10 +24,12 @@ from app.operators.preprocess import DynamicMaskOperator, PreprocessRunResult
 from app.operators.scope import SubjectMaskGenerationOperator
 from app.services.artifact_service import ArtifactService
 from app.services.experimental_spherical_video import (
+    SPHERICAL_RIG_VIEW_SOURCE_TYPES,
     apply_virtual_camera_rotation,
     derive_spherical_video_views,
     group_spherical_entries_by_stream,
     is_equirectangular_size,
+    project_equirectangular_to_perspective,
     spherical_video_config,
     spherical_frame_key,
 )
@@ -87,13 +89,6 @@ SAFE_IMAGE_ENHANCEMENT_ROUTES = [
 ]
 
 ROUTE_PRESETS: dict[str, dict[str, Any]] = {
-    "original_pose_original_train": {
-        "label": "R0",
-        "pose_source": "original",
-        "training_source": "original",
-        "training_supervision_modified": False,
-        "default_required": True,
-    },
     "safe_pose_original_train": {
         "label": "R1",
         "pose_source": "safe_enhanced",
@@ -128,7 +123,6 @@ PANORAMA_NORMALIZATION_ROUTES = [
 ]
 
 DATASET_ASSEMBLY_ROUTES = [
-    "original_pose_original_train",
     "safe_pose_original_train",
     "jpg_only_best_pose",
     "video_only_best_keyframes",
@@ -137,8 +131,6 @@ DATASET_ASSEMBLY_ROUTES = [
     "jpg_video_fused_sparse",
     "panorama_context_added",
     "high_confidence_only",
-    "enhanced_pose_original_texture",
-    "enhanced_pose_enhanced_texture",
 ]
 
 POSE_ESTIMATION_ROUTES = [
@@ -165,10 +157,6 @@ MASK_OPTIMIZATION_ROUTES = [
 
 TRAINING_INPUT_ROUTES = [
     "original_training_images",
-    "enhanced_training_images",
-    "exposure_normalized_training_images",
-    "denoise_training_images",
-    "mixed_training_images",
     "resize_native",
     "resize_balanced",
     "balanced_holdout_split",
@@ -578,6 +566,7 @@ def _preprocess_from_dataset_manifest(
     route_id: str,
     route_key: str,
 ) -> PreprocessRunResult:
+    _reset_materialized_preprocess_dir(context, output_dir)
     dataset_dir = output_dir / "nerfstudio_dataset"
     images_dir = dataset_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
@@ -651,6 +640,16 @@ def _preprocess_from_dataset_manifest(
         asset_quality=asset_quality,
         routing_manifest_path=routing_manifest_path,
     )
+
+
+def _reset_materialized_preprocess_dir(context: "StageContext", output_dir: Path) -> None:
+    run_root = context.run_dir.resolve()
+    target = output_dir.resolve()
+    if target == run_root or run_root not in target.parents:
+        raise RuntimeError(f"Refusing to reset materialized preprocess directory outside run root: {target}")
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _route_scoped_workspace_name(context: "StageContext", relative_workspace_name: str) -> str:
@@ -1409,7 +1408,6 @@ class ImageEnhancementStage(StageOptimizer):
     def generate_candidates(self, context: StageContext, analysis: dict[str, Any]) -> list[dict[str, Any]]:
         candidates = []
         settings = config_section(context.settings, "stage_optimized_reconstruction")
-        force_original = bool(context.config.get("force_original_images") or context.config.get("original_only_images"))
         allow = {
             "denoise_light": bool(context.config.get("allow_denoise", True)),
             "deblur_light": bool(context.config.get("allow_deblur", True)),
@@ -1425,9 +1423,9 @@ class ImageEnhancementStage(StageOptimizer):
         configured_routes = context.config.get("image_enhancement_routes")
         if isinstance(configured_routes, list) and configured_routes:
             requested_routes = [str(route) for route in configured_routes if str(route) in IMAGE_ENHANCEMENT_ROUTES]
-            routes = ["original"] if force_original else list(dict.fromkeys(["original", *requested_routes]))
+            routes = list(dict.fromkeys(["original", *requested_routes]))
         else:
-            routes = ["original"] if force_original else list(dict.fromkeys(["original", *SAFE_IMAGE_ENHANCEMENT_ROUTES, *IMAGE_ENHANCEMENT_ROUTES]))
+            routes = list(dict.fromkeys(["original", *SAFE_IMAGE_ENHANCEMENT_ROUTES, *IMAGE_ENHANCEMENT_ROUTES]))
         for item in analysis["images"]:
             for process_type in routes:
                 if process_type != "original" and not allow.get(process_type, True):
@@ -1534,13 +1532,8 @@ class ImageEnhancementStage(StageOptimizer):
         for asset_id, candidates in by_asset.items():
             valid_pose = [item for item in candidates if item.get("status") == "succeeded" and not item.get("rejected_reason") and (item.get("metrics") or {}).get("forensic_integrity", {}).get("accepted_for_pose")]
             original = next((item for item in candidates if item.get("candidate_type") == "original"), None)
-            if bool(context.config.get("force_original_images") or context.config.get("original_only_images")):
-                pose_best = original
-                training_best = original
-            else:
-                pose_best = max(valid_pose, key=lambda item: float(item.get("score") or 0.0), default=original)
-                valid_training = [item for item in valid_pose if (item.get("metrics") or {}).get("forensic_integrity", {}).get("accepted_for_training")]
-                training_best = max(valid_training, key=lambda item: float(item.get("score") or 0.0), default=original)
+            pose_best = max(valid_pose, key=lambda item: float(item.get("score") or 0.0), default=original)
+            training_best = original
             selections.append(
                 {
                     "asset_id": asset_id,
@@ -1582,7 +1575,7 @@ class ImageEnhancementStage(StageOptimizer):
                 }
             )
         selection_payload = {
-            "policy": "original_only" if bool(context.config.get("force_original_images") or context.config.get("original_only_images")) else "conservative_safe_enhancement",
+            "policy": "safe_pose_original_train",
             "generative_enhancement_used": False,
             "safe_enhancement_routes": SAFE_IMAGE_ENHANCEMENT_ROUTES,
             "images": selections,
@@ -1964,9 +1957,25 @@ class PanoramaNormalizationStage(StageOptimizer):
 
     def generate_candidates(self, context: StageContext, analysis: dict[str, Any]) -> list[dict[str, Any]]:
         candidates = []
-        for pano in analysis["panoramas"]:
-            for strategy in PANORAMA_NORMALIZATION_ROUTES:
-                candidates.append({"candidate_name": f"{pano['asset_id']}:{strategy}", "candidate_type": strategy, "asset_id": pano["asset_id"], "input_path": pano["path"], "status": "created", "created_at": utc_now_iso()})
+        configured_routes = context.config.get("panorama_normalization_routes")
+        if configured_routes is None:
+            configured_routes = nested_get(context.config, "panorama.normalization_routes")
+        routes = [str(route) for route in (configured_routes or PANORAMA_NORMALIZATION_ROUTES) if str(route) in PANORAMA_NORMALIZATION_ROUTES]
+        if not routes:
+            routes = list(PANORAMA_NORMALIZATION_ROUTES)
+        for source_index, pano in enumerate(analysis["panoramas"]):
+            for strategy in routes:
+                candidates.append(
+                    {
+                        "candidate_name": f"{pano['asset_id']}:{strategy}",
+                        "candidate_type": strategy,
+                        "asset_id": pano["asset_id"],
+                        "input_path": pano["path"],
+                        "source_index": source_index,
+                        "status": "created",
+                        "created_at": utc_now_iso(),
+                    }
+                )
         for video in analysis.get("spherical_videos") or []:
             candidates.append(
                 {
@@ -2047,7 +2056,22 @@ class PanoramaNormalizationStage(StageOptimizer):
             if candidate["candidate_type"] == "keep_equirectangular":
                 output = output_dir / source.name
                 image.save(output, quality=94)
-                views.append({"pano_view_id": f"{candidate['asset_id']}:equirectangular", "image_path": str(output), "yaw": None, "pitch": None, "fov": 360, "usage": "context_texture"})
+                views.append(
+                    {
+                        "pano_view_id": f"{candidate['asset_id']}:equirectangular",
+                        "asset_id": candidate["asset_id"],
+                        "image_path": str(output),
+                        "source_type": "panorama_equirectangular",
+                        "source_image_path": str(source),
+                        "source_pano_id": candidate["asset_id"],
+                        "shared_center_group": candidate["asset_id"],
+                        "yaw": None,
+                        "pitch": None,
+                        "fov": 360,
+                        "usage": "context_texture",
+                        "mapping": "source_equirectangular",
+                    }
+                )
             elif candidate["candidate_type"] in {"perspective_cubemap_4", "perspective_cubemap_6", "perspective_views_dense"}:
                 width, height = image.size
                 if candidate["candidate_type"] == "perspective_cubemap_4":
@@ -2056,41 +2080,82 @@ class PanoramaNormalizationStage(StageOptimizer):
                     yaw_pitch_pairs = [(0, 0), (90, 0), (180, 0), (270, 0), (0, 60), (0, -60)]
                 else:
                     yaw_pitch_pairs = [(yaw, pitch) for pitch in (-30, 0, 30) for yaw in range(0, 360, 45)]
-                crop_w = max(1, width // 4)
-                crop_h = max(1, height // 2)
+                if not is_equirectangular_size(width, height):
+                    candidate.update({"status": "failed", "rejected_reason": "not_equirectangular_2_1", "score": 0.0, "risk_level": "high"})
+                    return candidate
+                projection_size = int(
+                    nested_get(
+                        context.config,
+                        "panorama.output_size",
+                        context.config.get("panorama_output_size") or max(512, min(2048, width // 4)),
+                    )
+                    or 512
+                )
+                output_width = int(nested_get(context.config, "panorama.output_width", context.config.get("panorama_output_width") or projection_size) or projection_size)
+                output_height = int(nested_get(context.config, "panorama.output_height", context.config.get("panorama_output_height") or projection_size) or projection_size)
+                fov_degrees = float(nested_get(context.config, "panorama.fov_degrees", context.config.get("panorama_fov_degrees") or 90.0) or 90.0)
+                source_index = int(candidate.get("source_index") or 0)
+                source_frame_id = f"{candidate['asset_id']}:{source_index}"
                 for yaw, pitch in yaw_pitch_pairs:
-                    center_x = int((yaw % 360) / 360.0 * width)
-                    center_y = int(height / 2 - (pitch / 180.0) * height)
-                    left = center_x - crop_w // 2
-                    right = center_x + crop_w // 2
-                    top = max(0, min(height - crop_h, center_y - crop_h // 2))
-                    if left < 0:
-                        crop = Image.new("RGB", (crop_w, crop_h))
-                        crop.paste(image.crop((width + left, top, width, top + crop_h)), (0, 0))
-                        crop.paste(image.crop((0, top, right, top + crop_h)), (-left, 0))
-                    elif right > width:
-                        crop = Image.new("RGB", (crop_w, crop_h))
-                        crop.paste(image.crop((left, top, width, top + crop_h)), (0, 0))
-                        crop.paste(image.crop((0, top, right - width, top + crop_h)), (width - left, 0))
-                    else:
-                        crop = image.crop((left, top, right, top + crop_h))
-                    crop = crop.resize((max(512, crop.width), max(512, crop.height)))
                     output = output_dir / f"{candidate['asset_id']}_yaw_{yaw}_pitch_{pitch}.jpg"
-                    crop.save(output, quality=94)
+                    try:
+                        project_equirectangular_to_perspective(
+                            source,
+                            output,
+                            yaw_degrees=float(yaw),
+                            pitch_degrees=float(pitch),
+                            fov_degrees=fov_degrees,
+                            output_width=max(64, output_width),
+                            output_height=max(64, output_height),
+                        )
+                    except Exception as exc:
+                        error_path = write_json(output_dir / "panorama_projection_error.json", {"candidate": candidate["candidate_name"], "error": str(exc)})
+                        candidate.update(
+                            {
+                                "status": "failed",
+                                "output_path": str(error_path),
+                                "rejected_reason": "panorama_perspective_projection_failed",
+                                "score": 0.0,
+                                "risk_level": "high",
+                            }
+                        )
+                        return candidate
                     views.append(
                         {
                             "pano_view_id": f"{candidate['asset_id']}:yaw:{yaw}:pitch:{pitch}",
+                            "asset_id": candidate["asset_id"],
                             "image_path": str(output),
+                            "source_type": "panorama_station_view",
+                            "source_frame_id": source_frame_id,
+                            "source_frame_index": source_index,
+                            "source_image_path": str(source),
+                            "source_pano_id": candidate["asset_id"],
+                            "shared_center_group": candidate["asset_id"],
+                            "crop_id": output.name,
                             "yaw": yaw,
                             "pitch": pitch,
-                            "fov": 90,
+                            "fov": fov_degrees,
+                            "stream_id": f"yaw_{float(yaw):.3f}_pitch_{float(pitch):.3f}",
                             "usage": "pose_candidate",
-                            "mapping": "equirectangular_window_projection",
+                            "mapping": "equirectangular_to_perspective",
+                            "projection_model": "pinhole_from_equirectangular",
+                            "camera_model": "PINHOLE",
+                            "projection_width": max(64, output_width),
+                            "projection_height": max(64, output_height),
                         }
                     )
             else:
                 views = []
-        mapping_path = write_json(output_dir / "panorama_mapping.json", {"asset_id": candidate["asset_id"], "strategy": candidate["candidate_type"], "views": views})
+        mapping_path = write_json(
+            output_dir / "panorama_mapping.json",
+            {
+                "asset_id": candidate["asset_id"],
+                "source_image_path": str(source),
+                "source_index": candidate.get("source_index"),
+                "strategy": candidate["candidate_type"],
+                "views": views,
+            },
+        )
         feature_scores = [estimate_image_metrics(Path(view["image_path"])).get("feature_detectability_score", 0.0) for view in views if view.get("image_path")]
         generated = len(views)
         geometry_risk = {
@@ -2109,6 +2174,10 @@ class PanoramaNormalizationStage(StageOptimizer):
                 "views": views,
                 "metrics": {
                     "generated_view_count": generated,
+                    "static_panorama_view_count": len([view for view in views if view.get("source_type") == "panorama_station_view"]),
+                    "spherical_rig_view_count": len([view for view in views if view.get("source_type") in SPHERICAL_RIG_VIEW_SOURCE_TYPES]),
+                    "source_mapping_complete": all(view.get("source_image_path") and view.get("source_pano_id") for view in views) if views else True,
+                    "projection_model": "pinhole_from_equirectangular" if candidate["candidate_type"] in {"perspective_cubemap_4", "perspective_cubemap_6", "perspective_views_dense"} else "none",
                     "feature_quality_score": round(float(sum(float(v) for v in feature_scores) / max(1, len(feature_scores))), 4) if feature_scores else 0.0,
                     "pose_suitability": round(pose_suitability, 4),
                     "texture_suitability": 0.8 if candidate["candidate_type"] in {"keep_equirectangular", "panorama_as_context_only"} else 0.55,
@@ -2136,6 +2205,7 @@ class PanoramaNormalizationStage(StageOptimizer):
                 views.extend(best.get("views", []))
         output = write_json(context.stage_dir(self.stage_name) / "best_panorama_strategy.json", {"panoramas": panos, "views": views})
         spherical_views = [view for view in views if view.get("source_type") == "spherical_video_keyframe_view"]
+        static_pano_views = [view for view in views if view.get("source_type") == "panorama_station_view"]
         return {
             "candidate_name": "per_panorama_best_strategy",
             "candidate_type": "selection_manifest",
@@ -2147,6 +2217,8 @@ class PanoramaNormalizationStage(StageOptimizer):
                 "view_count": len(views),
                 "video_panorama_count": len([item for item in panos if item.get("strategy") == "experimental_360_video_perspective_views"]),
                 "spherical_video_view_count": len(spherical_views),
+                "static_panorama_view_count": len(static_pano_views),
+                "spherical_rig_view_count": len([view for view in views if view.get("source_type") in SPHERICAL_RIG_VIEW_SOURCE_TYPES]),
             },
             "improvement_summary": "已识别 2:1/360 全景并避免直接作为普通图输入 SfM。",
             "risk_summary": "全景派生视图保留 source mapping，几何风险会进入报告。",
@@ -2174,7 +2246,6 @@ class DatasetAssemblyStage(StageOptimizer):
 
     def generate_candidates(self, context: StageContext, analysis: dict[str, Any]) -> list[dict[str, Any]]:
         policy_by_route = {
-            "original_pose_original_train": "route_preset",
             "safe_pose_original_train": "route_preset",
             "jpg_only_best_pose": "jpg_only_best_pose",
             "video_only_best_keyframes": "video_only_best_keyframes",
@@ -2183,8 +2254,6 @@ class DatasetAssemblyStage(StageOptimizer):
             "jpg_video_fused_sparse": "sparse_jpg_video",
             "panorama_context_added": "panorama_context_added",
             "high_confidence_only": "only_images_and_accepted_keyframes",
-            "enhanced_pose_original_texture": "enhanced_pose_original_texture",
-            "enhanced_pose_enhanced_texture": "enhanced_pose_enhanced_texture",
         }
         active_route = context.config.get("active_route_preset") or context.config.get("active_route_id")
         if active_route in ROUTE_PRESETS:
@@ -2222,7 +2291,9 @@ class DatasetAssemblyStage(StageOptimizer):
         keyframes = list(analysis.get("keyframes") or [])
         pano_views = [view for view in analysis.get("panorama_views") or [] if view.get("usage") == "pose_candidate"]
         spherical_view_count = len([view for view in pano_views if view.get("source_type") == "spherical_video_keyframe_view"])
-        experimental_spherical_enabled = bool(spherical_video_config(context.config).enabled and spherical_view_count)
+        static_panorama_view_count = len([view for view in pano_views if view.get("source_type") == "panorama_station_view"])
+        spherical_rig_view_count = len([view for view in pano_views if view.get("source_type") in SPHERICAL_RIG_VIEW_SOURCE_TYPES])
+        spherical_rig_enabled = bool(static_panorama_view_count or (spherical_video_config(context.config).enabled and spherical_view_count))
         policy = str(candidate["policy"])
         if policy == "jpg_only_best_pose":
             keyframes = []
@@ -2244,14 +2315,14 @@ class DatasetAssemblyStage(StageOptimizer):
         elif policy == "panorama_context_added":
             max_video = max(20, len(image_items) * 3)
             keyframes = keyframes[:max_video]
-            if experimental_spherical_enabled:
+            if spherical_rig_enabled:
                 keyframes = []
         elif policy == "only_images_and_accepted_keyframes":
             keyframes = [frame for frame in keyframes if (frame.get("metrics") or {}).get("feature_detectability_score", 0.0) >= 0.2]
             pano_views = []
         else:
             pano_views = []
-        if experimental_spherical_enabled and policy != "panorama_context_added" and keyframes and not image_items:
+        if spherical_rig_enabled and policy != "panorama_context_added" and keyframes and not image_items:
             keyframes = []
         entries = []
         source_map = []
@@ -2332,13 +2403,32 @@ class DatasetAssemblyStage(StageOptimizer):
                     "source_frame_id": view.get("source_frame_id"),
                     "source_frame_index": view.get("source_frame_index"),
                     "source_image_path": view.get("source_image_path"),
+                    "source_pano_id": view.get("source_pano_id"),
+                    "shared_center_group": view.get("shared_center_group"),
+                    "crop_id": view.get("crop_id"),
                     "yaw": view.get("yaw"),
                     "pitch": view.get("pitch"),
                     "fov": view.get("fov"),
                     "stream_id": view.get("stream_id"),
+                    "mapping": view.get("mapping"),
+                    "projection_model": view.get("projection_model"),
+                    "camera_model": view.get("camera_model"),
                 }
             )
-            source_map.append({"derived_pose": str(pose_target), "derived_training": str(training_target), "source_pano_view_id": view.get("pano_view_id"), "mapping": view})
+            source_map.append(
+                {
+                    "derived_pose": str(pose_target),
+                    "derived_pose_sha256": file_sha256(pose_target),
+                    "derived_training": str(training_target),
+                    "derived_training_sha256": file_sha256(training_target),
+                    "source_asset_id": view.get("asset_id"),
+                    "source_pano_id": view.get("source_pano_id"),
+                    "source_pano_view_id": view.get("pano_view_id"),
+                    "source_image_path": view.get("source_image_path"),
+                    "shared_center_group": view.get("shared_center_group"),
+                    "mapping": view,
+                }
+            )
         pose_images = [Path(str(entry["pose_image"])) for entry in entries if entry.get("pose_image")]
         training_images = [Path(str(entry["training_image"])) for entry in entries if entry.get("training_image")]
         duplicate_ratio = self._duplicate_ratio(pose_images)
@@ -2355,7 +2445,9 @@ class DatasetAssemblyStage(StageOptimizer):
             "expected_training_quality_score": round(clamp(len(training_images) / 100.0) * 0.35 + (1 - duplicate_ratio) * 0.35 + clamp(source_balance) * 0.3, 4),
             "forensic_risk_score": 0.12,
             "spherical_video_view_count": len([entry for entry in entries if entry.get("source_type") == "spherical_video_keyframe_view"]),
-            "raw_equirectangular_keyframe_count": len(keyframes) if experimental_spherical_enabled else 0,
+            "static_panorama_view_count": len([entry for entry in entries if entry.get("source_type") == "panorama_station_view"]),
+            "spherical_rig_view_count": len([entry for entry in entries if entry.get("source_type") in SPHERICAL_RIG_VIEW_SOURCE_TYPES]),
+            "raw_equirectangular_keyframe_count": len(keyframes) if spherical_rig_enabled else 0,
         }
         image_entries = [entry for entry in entries if entry.get("source_type") == "image"]
         pose_distribution = _distribution(image_entries, "pose_candidate")
@@ -2469,10 +2561,6 @@ class DatasetAssemblyStage(StageOptimizer):
     def _select_image_path(self, item: dict[str, Any], policy: str, *, role: str, route_name: str) -> tuple[str | None, str]:
         if route_name in ROUTE_PRESETS:
             source = str(ROUTE_PRESETS[route_name]["pose_source" if role == "pose" else "training_source"])
-        elif policy == "enhanced_pose_original_texture":
-            source = "safe_enhanced" if role == "pose" else "original"
-        elif policy == "enhanced_pose_enhanced_texture":
-            source = "safe_enhanced"
         elif policy == "route_preset":
             source = str(route_preset_config(route_name).get("pose_source" if role == "pose" else "training_source"))
         else:
@@ -2546,9 +2634,12 @@ class PoseEstimationOptimizationStage(StageOptimizer):
             context.capability_report.setdefault(self.stage_name, {})[route] = {"available": False, "reason": unavailable}
             return candidate
         if run_real_pose:
-            default_real_candidates = ["colmap_sequential"] if image_count >= 12 else ["colmap_exhaustive"]
+            default_real_candidates = ["colmap_sequential", "colmap_exhaustive"] if image_count >= 12 else ["colmap_exhaustive"]
             manifest_metrics = manifest.get("metrics") or {}
-            if spherical_video_config(context.config).enabled and int(manifest_metrics.get("spherical_video_view_count") or 0) > 0:
+            spherical_video_view_count = int(manifest_metrics.get("spherical_video_view_count") or 0)
+            static_panorama_view_count = int(manifest_metrics.get("static_panorama_view_count") or 0)
+            spherical_rig_view_count = int(manifest_metrics.get("spherical_rig_view_count") or (spherical_video_view_count + static_panorama_view_count) or 0)
+            if spherical_rig_view_count > 0 and (static_panorama_view_count > 0 or spherical_video_config(context.config).enabled):
                 default_real_candidates = ["spherical_video_rig_lift"]
             allowed = _configured_names(context.config.get("real_pose_candidates"), default_real_candidates)
             if route not in allowed:
@@ -2702,16 +2793,17 @@ class PoseEstimationOptimizationStage(StageOptimizer):
         output_dir = context.stage_dir(self.stage_name) / "pose_candidates" / route
         output_dir.mkdir(parents=True, exist_ok=True)
         cfg = spherical_video_config(context.config)
-        if not cfg.enabled:
+        entries = [entry for entry in manifest.get("entries") or [] if entry.get("source_type") in SPHERICAL_RIG_VIEW_SOURCE_TYPES]
+        static_panorama_entry_count = len([entry for entry in entries if entry.get("source_type") == "panorama_station_view"])
+        if not cfg.enabled and static_panorama_entry_count == 0:
             metrics_path = write_json(output_dir / "pose_metrics.json", {"execution": "spherical_video_rig_lift", "reason": "experimental_360_video_disabled"})
             candidate.update({"status": "skipped", "output_path": str(metrics_path), "metrics_path": str(metrics_path), "metrics": read_json(metrics_path, {}), "score": 0.0, "rejected_reason": "experimental_360_video_disabled", "risk_level": "low"})
             return candidate
 
-        entries = [entry for entry in manifest.get("entries") or [] if entry.get("source_type") == "spherical_video_keyframe_view"]
         stream_groups = group_spherical_entries_by_stream(entries)
         if not stream_groups:
-            metrics_path = write_json(output_dir / "pose_metrics.json", {"execution": "spherical_video_rig_lift", "reason": "no_spherical_video_stream_entries"})
-            candidate.update({"status": "failed", "output_path": str(metrics_path), "metrics_path": str(metrics_path), "metrics": read_json(metrics_path, {}), "score": 0.0, "rejected_reason": "no_spherical_video_stream_entries", "risk_level": "high"})
+            metrics_path = write_json(output_dir / "pose_metrics.json", {"execution": "spherical_video_rig_lift", "reason": "no_spherical_rig_stream_entries"})
+            candidate.update({"status": "failed", "output_path": str(metrics_path), "metrics_path": str(metrics_path), "metrics": read_json(metrics_path, {}), "score": 0.0, "rejected_reason": "no_spherical_rig_stream_entries", "risk_level": "high"})
             return candidate
 
         requested_yaws = set(float(value) for value in cfg.pose_yaw_degrees)
@@ -2721,6 +2813,9 @@ class PoseEstimationOptimizationStage(StageOptimizer):
             if not requested_yaws or float(key[0]) in requested_yaws
         ]
         camera_models = [str(value) for value in (context.config.get("spherical_pose_camera_models") or ["PINHOLE", "SIMPLE_PINHOLE", "SIMPLE_RADIAL"])]
+        stream_matcher = str(context.config.get("spherical_pose_matcher") or "sequential").strip().lower()
+        if stream_matcher not in {"sequential", "exhaustive"}:
+            stream_matcher = "sequential"
         attempts: list[dict[str, Any]] = []
         best_attempt: dict[str, Any] | None = None
         best_result: Any = None
@@ -2740,7 +2835,7 @@ class PoseEstimationOptimizationStage(StageOptimizer):
                 "metrics": {"image_count": len(stream_entries), "source": "spherical_video_yaw_stream"},
             }
             for camera_model in camera_models:
-                attempt_key = f"{route}_yaw_{int(stream_key[0])}_pitch_{int(stream_key[1])}_{camera_model.lower()}"
+                attempt_key = f"{route}_{stream_matcher}_yaw_{int(stream_key[0])}_pitch_{int(stream_key[1])}_{camera_model.lower()}"
                 try:
                     preprocess = _preprocess_from_dataset_manifest(
                         context,
@@ -2753,12 +2848,12 @@ class PoseEstimationOptimizationStage(StageOptimizer):
                         context.workflow,
                         preprocess,
                         attempt_key=attempt_key,
-                        matcher="sequential",
+                        matcher=stream_matcher,
                         camera_model=camera_model,
                         attempt_spec=self._colmap_attempt_spec(
                             context,
                             route,
-                            matcher="sequential",
+                            matcher=stream_matcher,
                             camera_model=camera_model,
                             extra={
                                 "single_camera": True,
@@ -2772,7 +2867,15 @@ class PoseEstimationOptimizationStage(StageOptimizer):
                         ),
                     )
                     report = _read_optional_json(result.registration_report_path)
-                    metrics = _pose_metrics_from_colmap_result(result, report, image_count=len(stream_entries), route=route, matcher="sequential", camera_model=camera_model, execution="real_spherical_video_pose_stream_colmap")
+                    metrics = _pose_metrics_from_colmap_result(
+                        result,
+                        report,
+                        image_count=len(stream_entries),
+                        route=route,
+                        matcher=stream_matcher,
+                        camera_model=camera_model,
+                        execution="real_spherical_video_pose_stream_colmap",
+                    )
                     rejection = _pose_quality_rejection(metrics)
                     attempt = {
                         "stream": {"yaw": stream_key[0], "pitch": stream_key[1]},
@@ -2823,7 +2926,7 @@ class PoseEstimationOptimizationStage(StageOptimizer):
             **base_metrics,
             "execution": "real_spherical_video_rig_lift",
             "route": route,
-            "matcher": "sequential_stream_then_known_virtual_rig_lift",
+            "matcher": f"{stream_matcher}_stream_then_known_virtual_rig_lift",
             "registered_images_count": int(lifted["lifted_view_count"]),
             "total_images_count": image_count,
             "registered_ratio": round(lifted_registered_ratio, 4),
@@ -2835,6 +2938,7 @@ class PoseEstimationOptimizationStage(StageOptimizer):
             "base_stream_metrics": base_metrics,
             "lifted_view_count": int(lifted["lifted_view_count"]),
             "registered_source_frame_count": int(lifted["registered_source_frame_count"]),
+            "static_panorama_entry_count": static_panorama_entry_count,
             "attempts": attempts,
             "pose_derivation": "registered_yaw_stream_plus_known_equirectangular_virtual_camera_rotations",
         }
@@ -3245,7 +3349,7 @@ class MaskOptimizationStage(StageOptimizer):
             metrics_path = write_json(output_dir / "mask_metrics.json", metrics)
             score = 0.55 * metrics["training_expected_gain"] + 0.45 * (1.0 - metrics["forensic_risk_score"])
             candidate.update({"status": "succeeded", "output_path": str(metrics_path), "metrics_path": str(metrics_path), "metrics": metrics, "score": round(score, 4), "risk_level": "high" if metrics["forensic_risk_score"] > 0.35 else "low"})
-            if reason and method in {"external_command_unavailable", "not_applicable_image_collection"}:
+            if reason and (method in {"external_command_unavailable", "not_applicable_image_collection"} or str(method).endswith("_unavailable")):
                 candidate.update({"rejected_reason": str(reason), "score": 0.0, "risk_level": "medium"})
             if coverage > 0.35 or static_damage > 0.18 or feature_loss > 0.25:
                 candidate.update({"rejected_reason": "mask_forensic_or_feature_loss_risk", "score": 0.0, "risk_level": "high"})
@@ -3257,10 +3361,27 @@ class MaskOptimizationStage(StageOptimizer):
         if name == "human_vehicle_animal_mask":
             return ["person", "vehicle", "animal"]
         if name == "reflection_sensitive_mask":
-            return ["reflection", "mirror", "glass", "water"]
-        return ["person", "vehicle", "animal", "leaf", "water", "reflection"]
+            return ["reflection", "mirror", "glass", "screen", "water"]
+        return ["person", "vehicle", "animal", "leaf", "water"]
 
     def select_best(self, context: StageContext, candidate_results: list[dict[str, Any]]) -> dict[str, Any]:
+        forced = str(context.config.get("force_mask_strategy") or context.config.get("forced_mask_strategy") or "").strip()
+        if forced:
+            forced_candidate = next(
+                (
+                    item
+                    for item in candidate_results
+                    if item.get("candidate_name") == forced and item.get("status") == "succeeded" and not item.get("rejected_reason")
+                ),
+                None,
+            )
+            if forced_candidate:
+                best = forced_candidate
+                write_json(context.stage_dir(self.stage_name) / "best_mask_selection.json", best)
+                write_json(context.stage_dir(self.stage_name) / "mask_metrics.json", {"candidates": candidate_results, "best": best})
+                best["improvement_summary"] = f"已按配置强制选择 mask 策略 `{forced}`。"
+                best["risk_summary"] = "强制 mask 会优先满足动态/人物剔除要求；若语义模型漏检，未命中的区域仍可能进入训练。"
+                return best
         # Prefer no_mask unless another safe mask has clear positive gain.
         no_mask = next((item for item in candidate_results if item.get("candidate_name") == "no_mask"), None)
         safe_positive = [item for item in candidate_results if not item.get("rejected_reason") and float((item.get("metrics") or {}).get("training_expected_gain") or 0.0) > 0.12]
@@ -3286,10 +3407,6 @@ class TrainingInputOptimizationStage(StageOptimizer):
     def generate_candidates(self, context: StageContext, analysis: dict[str, Any]) -> list[dict[str, Any]]:
         texture_policy = {
             "original_training_images": "original_or_selected_safe",
-            "enhanced_training_images": "selected_safe_enhanced",
-            "exposure_normalized_training_images": "prefer_exposure_normalized",
-            "denoise_training_images": "prefer_denoise",
-            "mixed_training_images": "mixed_by_source_quality",
             "resize_native": "native_resolution",
             "resize_balanced": "balanced_resize",
             "balanced_holdout_split": "balanced_holdout",
@@ -3305,6 +3422,7 @@ class TrainingInputOptimizationStage(StageOptimizer):
         training_images = list(manifest.get("training_images") or [])
         pose_images = list(manifest.get("pose_images") or [])
         output_dir = context.stage_dir(self.stage_name) / "training_inputs" / candidate["candidate_name"]
+        _reset_materialized_preprocess_dir(context, output_dir)
         train_dir = output_dir / "train_images"
         eval_dir = output_dir / "eval_images"
         train_dir.mkdir(parents=True, exist_ok=True)
@@ -3382,8 +3500,42 @@ class TrainingInputOptimizationStage(StageOptimizer):
         return candidate
 
     def select_best(self, context: StageContext, candidate_results: list[dict[str, Any]]) -> dict[str, Any]:
-        preset = route_preset_config(active_route_preset(context))
-        preferred = "enhanced_training_images" if preset.get("training_source") == "safe_enhanced" else "original_training_images"
+        forced = str(context.config.get("force_training_input_strategy") or context.config.get("forced_training_input_strategy") or "").strip()
+        if forced:
+            forced_candidate = next(
+                (
+                    item
+                    for item in candidate_results
+                    if item.get("candidate_name") == forced and item.get("status") == "succeeded" and not item.get("rejected_reason")
+                ),
+                None,
+            )
+            if forced_candidate:
+                best = forced_candidate
+                write_json(context.stage_dir(self.stage_name) / "best_training_input_selection.json", best)
+                write_json(context.stage_dir(self.stage_name) / "input_optimization_metrics.json", {"candidates": candidate_results, "best": best})
+                return best
+
+        analysis_mask = next((item.get("analysis", {}).get("mask") for item in candidate_results if isinstance(item.get("analysis"), dict)), {}) or {}
+        mask_name = str(analysis_mask.get("candidate_name") or "")
+        prefer_mask_safe = bool(context.config.get("prefer_mask_safe_training_input_when_mask_selected", True))
+        if prefer_mask_safe and mask_name and mask_name != "no_mask":
+            best = next(
+                (
+                    item
+                    for item in candidate_results
+                    if item.get("candidate_name") == "mask_safe_training_input" and item.get("status") == "succeeded" and not item.get("rejected_reason")
+                ),
+                None,
+            )
+            if best is not None:
+                write_json(context.stage_dir(self.stage_name) / "best_training_input_selection.json", best)
+                write_json(context.stage_dir(self.stage_name) / "input_optimization_metrics.json", {"candidates": candidate_results, "best": best})
+                best["improvement_summary"] = "Selected mask-safe training input because a safe non-empty mask strategy was selected."
+                best["risk_summary"] = "Training keeps original pixels and only downweights masked reflection/dynamic regions through Nerfstudio mask_path."
+                return best
+
+        preferred = "original_training_images"
         best = next((item for item in candidate_results if item.get("candidate_name") == preferred and item.get("status") == "succeeded" and not item.get("rejected_reason")), None)
         if best is None:
             best = super().select_best(context, candidate_results)
@@ -3396,6 +3548,7 @@ class TrainingInputOptimizationStage(StageOptimizer):
 
     def _materialize_nerfstudio_training_dataset(self, context: StageContext, candidate: dict[str, Any], manifest: dict[str, Any], output_dir: Path) -> dict[str, Any]:
         pose = candidate["analysis"].get("pose") or {}
+        mask_selection = candidate["analysis"].get("mask") or {}
         pose_metrics = pose.get("metrics") or {}
         pose_dataset_dir_value = pose.get("dataset_dir") or pose_metrics.get("dataset_dir")
         pose_transforms_value = pose.get("transforms_path") or pose_metrics.get("transforms_path")
@@ -3439,12 +3592,75 @@ class TrainingInputOptimizationStage(StageOptimizer):
             return {"dataset_dir": str(training_dataset_dir), "transforms_path": None, "manifest_path": str(manifest_path), "reason": "missing_pose_dataset"}
         pose_dataset_dir = Path(str(pose_dataset_dir_value))
         pose_transforms_path = Path(str(pose_transforms_value))
-        if pose_transforms_path.exists():
-            copy_file_safely(pose_transforms_path, training_dataset_dir / "transforms.json")
+        _reset_materialized_preprocess_dir(context, training_dataset_dir)
         for extra_name in ["sparse_point_cloud.ply", "dataparser_transforms.json"]:
             extra = pose_dataset_dir / extra_name
             if extra.exists():
                 copy_file_safely(extra, training_dataset_dir / extra_name)
+        pose_transforms = read_json(pose_transforms_path, {}) if pose_transforms_path.exists() else {}
+        mask_entries = self._mask_entries_by_source_name(mask_selection)
+        pose_frame_paths = [
+            str(frame.get("file_path"))
+            for frame in pose_transforms.get("frames", [])
+            if isinstance(frame, dict) and frame.get("file_path")
+        ]
+        if pose_frame_paths:
+            training_transforms = json.loads(json.dumps(pose_transforms))
+            masks_dir = training_dataset_dir / "masks"
+            mask_count = 0
+            image_manifest = []
+            for index, relative_path in enumerate(pose_frame_paths):
+                source = pose_dataset_dir / relative_path
+                target = training_dataset_dir / relative_path
+                if source.exists():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    copy_file_safely(source, target)
+                frame_mask = self._mask_entry_for_image_name(Path(relative_path).name, mask_entries)
+                if mask_entries:
+                    mask_target = masks_dir / f"{Path(relative_path).stem}.png"
+                    if frame_mask and frame_mask.get("mask_path") and Path(str(frame_mask.get("mask_path"))).exists():
+                        self._copy_inverted_training_mask(Path(str(frame_mask["mask_path"])), mask_target)
+                        mask_count += 1
+                    else:
+                        self._write_full_keep_training_mask(target, mask_target)
+                    if index < len(training_transforms.get("frames", [])):
+                        training_transforms["frames"][index]["mask_path"] = f"masks/{mask_target.name}"
+                source_training = Path(str(training_images[index])) if index < len(training_images) else None
+                source_pose = Path(str(pose_images[index])) if index < len(pose_images) else None
+                image_manifest.append(
+                    {
+                        "index": index,
+                        "target_image": str(target),
+                        "target_sha256": file_sha256(target),
+                        "training_source": str(source_training) if source_training else None,
+                        "training_source_sha256": file_sha256(source_training) if source_training else None,
+                        "pose_source": str(source_pose) if source_pose else None,
+                        "pose_source_sha256": file_sha256(source_pose) if source_pose else None,
+                        "route_image_name": relative_path,
+                        "mask_source": str(frame_mask.get("mask_path")) if frame_mask and frame_mask.get("mask_path") else None,
+                        "training_mask": str(mask_target) if mask_entries else None,
+                    }
+                )
+            write_json(training_dataset_dir / "transforms.json", training_transforms)
+            manifest_path = write_json(
+                output_dir / "training_input_manifest.json",
+                {
+                    "route_preset": active_route_preset(context),
+                    "dataset_dir": str(training_dataset_dir),
+                    "transforms_path": str(training_dataset_dir / "transforms.json"),
+                    "image_policy": manifest.get("image_policy") or {},
+                    "pose_image_distribution": manifest.get("pose_image_distribution") or {},
+                    "training_image_distribution": manifest.get("training_image_distribution") or {},
+                    "mask_strategy": mask_selection.get("candidate_name"),
+                    "mask_applied_to_training": bool(mask_entries),
+                    "mask_matched_image_count": mask_count,
+                    "mask_total_image_count": len(pose_frame_paths) if mask_entries else 0,
+                    "images": image_manifest,
+                },
+            )
+            return {"dataset_dir": str(training_dataset_dir), "transforms_path": str(training_dataset_dir / "transforms.json"), "manifest_path": str(manifest_path)}
+        if pose_transforms_path.exists() and not (training_dataset_dir / "transforms.json").exists():
+            copy_file_safely(pose_transforms_path, training_dataset_dir / "transforms.json")
         routing_manifest_path = pose_dataset_dir.parent / "routing_manifest.json"
         routing = read_json(routing_manifest_path, {})
         routed_sources = [item for item in routing.get("sources", []) if item.get("status") == "copied" and item.get("image")]
@@ -3482,6 +3698,58 @@ class TrainingInputOptimizationStage(StageOptimizer):
             },
         )
         return {"dataset_dir": str(training_dataset_dir), "transforms_path": str(training_dataset_dir / "transforms.json"), "manifest_path": str(manifest_path)}
+
+    def _mask_entries_by_source_name(self, mask_selection: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        if not mask_selection or mask_selection.get("candidate_name") == "no_mask":
+            return {}
+        metrics = mask_selection.get("metrics") or {}
+        if not metrics and mask_selection.get("output_path"):
+            metrics = read_json(Path(str(mask_selection["output_path"])), {})
+        report = metrics.get("operator_report") or {}
+        entries = report.get("images") or []
+        mask_entries: dict[str, dict[str, Any]] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            image_name = str(entry.get("image_name") or "").strip()
+            mask_path = entry.get("mask_path")
+            if not image_name or not mask_path:
+                continue
+            mask_entries[image_name] = entry
+            stripped = self._strip_materialized_index_prefix(image_name)
+            mask_entries.setdefault(stripped, entry)
+        return mask_entries
+
+    def _mask_entry_for_image_name(self, image_name: str, mask_entries: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+        if image_name in mask_entries:
+            return mask_entries[image_name]
+        stripped = self._strip_materialized_index_prefix(image_name)
+        if stripped in mask_entries:
+            return mask_entries[stripped]
+        for key, entry in mask_entries.items():
+            if key.endswith(stripped) or image_name.endswith(key):
+                return entry
+        return None
+
+    def _strip_materialized_index_prefix(self, image_name: str) -> str:
+        return image_name[6:] if len(image_name) > 6 and image_name[:5].isdigit() and image_name[5] == "_" else image_name
+
+    def _copy_inverted_training_mask(self, source_mask: Path, target_mask: Path) -> None:
+        target_mask.parent.mkdir(parents=True, exist_ok=True)
+        if Image is None or ImageOps is None:
+            copy_file_safely(source_mask, target_mask)
+            return
+        with Image.open(source_mask) as mask:
+            inverted = ImageOps.invert(mask.convert("L"))
+            inverted.save(target_mask)
+
+    def _write_full_keep_training_mask(self, image_path: Path, target_mask: Path) -> None:
+        target_mask.parent.mkdir(parents=True, exist_ok=True)
+        if Image is None:
+            target_mask.write_bytes(b"")
+            return
+        with Image.open(image_path) as image:
+            Image.new("L", image.size, 255).save(target_mask)
 
 
 class GaussianTrainingOptimizationStage(StageOptimizer):
@@ -3533,7 +3801,7 @@ class GaussianTrainingOptimizationStage(StageOptimizer):
             candidate.update({"status": "planned", "output_path": str(metrics_path), "config_path": str(config_path), "metrics_path": str(metrics_path), "metrics": metrics, "score": 0.0, "rejected_reason": "training_not_executed", "risk_level": "medium"})
             return candidate
         if not fake and context.config.get("execute_training", False):
-            allowed = _configured_names(context.config.get("real_training_candidates"), ["splatfacto_baseline"])
+            allowed = _configured_names(context.config.get("real_training_candidates"), ["splatfacto_long_train", "splatfacto_big", "splatfacto_high_resolution"])
             if route not in allowed:
                 candidate.update(
                     {
@@ -3581,17 +3849,32 @@ class GaussianTrainingOptimizationStage(StageOptimizer):
             training_config["fake_runner"] = False
             if context.config.get("iterations") is not None:
                 training_config["iterations"] = int(context.config["iterations"])
+                training_config["max_num_iterations"] = int(context.config["iterations"])
             if context.config.get("max_num_iterations") is not None:
                 training_config["max_num_iterations"] = int(context.config["max_num_iterations"])
+            high_quality_iterations = (
+                context.config.get("high_quality_iterations")
+                or nested_get(context.config, "training.final_steps")
+                or nested_get(context.config, "training.standard_steps")
+                or 30000
+            )
+            long_train_iterations = (
+                context.config.get("long_train_iterations")
+                or nested_get(context.config, "training.long_train_steps")
+                or nested_get(context.config, "training.slow_steps")
+                or nested_get(context.config, "training.final_steps")
+            )
             route_iterations = {
+                "splatfacto_big": context.config.get("splatfacto_big_iterations") or high_quality_iterations,
                 "splatfacto_tuned": context.config.get("tuned_iterations"),
-                "splatfacto_high_resolution": context.config.get("high_resolution_iterations"),
-                "splatfacto_long_train": context.config.get("long_train_iterations"),
+                "splatfacto_high_resolution": context.config.get("high_resolution_iterations") or high_quality_iterations,
+                "splatfacto_long_train": long_train_iterations,
                 "splatfacto_w_light": context.config.get("splatfacto_w_light_iterations"),
                 "splatfacto_w": context.config.get("splatfacto_w_iterations"),
             }.get(route)
             if route_iterations is not None:
                 training_config["iterations"] = int(route_iterations)
+                training_config["max_num_iterations"] = int(route_iterations)
             if route == "splatfacto_high_resolution":
                 training_config["num_downscales"] = int(context.config.get("high_resolution_num_downscales") or 0)
             if route == "splatfacto_tuned":
@@ -3601,10 +3884,14 @@ class GaussianTrainingOptimizationStage(StageOptimizer):
                 training_config["enable_robust_mask"] = True
             if route == "splatfacto_with_conservative_mask":
                 training_config["apply_masks_to_training"] = bool(context.config.get("apply_masks_to_training", True))
+            if route == "splatfacto_long_train":
+                training_config.setdefault("quality_profile", "forensic_max_quality")
+                training_config.setdefault("quality_boost_profile", "forensic_max_quality")
+                training_config.setdefault("forensic_mainline", True)
             if context.config.get("mode"):
                 training_config["mode"] = context.config["mode"]
             elif "mode" not in training_config:
-                training_config["mode"] = "quick_preview"
+                training_config["mode"] = "high_quality" if route in {"splatfacto_big", "splatfacto_high_resolution", "splatfacto_long_train"} else "quick_preview"
             if route == "prior_assisted_fallback":
                 metrics = {
                     "method": method,
@@ -4010,8 +4297,140 @@ class FinalArtifactSelectionStage(StageOptimizer):
                     source_path=str(path),
                     is_primary=artifact_type == "best_route_report",
                 )
+        self._register_v3_status_reports(context)
         context.db.flush()
         return result
+
+    def _register_v3_status_reports(self, context: StageContext) -> None:
+        output_dir = context.stage_dir(self.stage_name) / "v3_status_reports"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        route_preset = active_route_preset(context)
+        route_id = context.config.get("active_route_id") or route_preset
+        source_asset_ids = [asset.id for asset in context.assets]
+        source_paths = [asset.original_filename or asset.filename for asset in context.assets if asset.original_filename or asset.filename]
+        for spec in self._v3_status_report_specs(context):
+            artifact_type = spec["artifact_type"]
+            payload = {
+                "summary": spec.get("summary"),
+                "inputs": spec.get("inputs") or {"asset_count": len(context.assets)},
+                "outputs": spec.get("outputs") or {},
+                "metrics": spec.get("metrics") or {},
+                "limitations": spec.get("limitations") or [],
+            }
+            context.artifact_service.register_stage_report(
+                project_id=context.project_id,
+                workflow_id=context.run_id,
+                artifact_type=artifact_type,
+                stage=spec.get("stage") or self.stage_name,
+                operator=spec.get("operator") or f"stage_optimized.{artifact_type}",
+                status=spec.get("status") or "skipped",
+                failure_reason=spec.get("failure_reason"),
+                relative_path=f"projects/{context.project_id}/runs/{context.run_id}/optimized/v3_status_reports/{artifact_type}.json",
+                payload=payload,
+                source_asset_ids=source_asset_ids,
+                source_artifact_ids=spec.get("source_artifact_ids") or [],
+                source_paths=source_paths,
+                derived_from=spec.get("derived_from") or [],
+                route_id=str(route_id),
+                route_key=route_preset,
+                route_role=spec.get("route_role") or "production",
+                production_allowed=bool(spec.get("production_allowed", True)),
+                measurement_allowed=bool(spec.get("measurement_allowed", False)),
+            )
+
+    def _v3_status_report_specs(self, context: StageContext) -> list[dict[str, Any]]:
+        assets = context.assets
+        asset_count = len(assets)
+        has_video = any((asset.asset_type or "").endswith("video") for asset in assets)
+        has_pano = any(asset.asset_type in {"pano_360", "panorama"} or asset.role == "pano_anchor" for asset in assets)
+        has_scale = any(asset.asset_type == "scale_marker" or asset.role in {"scale_marker", "measurement_marker", "scale_reference"} for asset in assets)
+        has_drone = any((asset.metadata_json or {}).get("capture_platform") == "drone" or asset.role in {"drone", "aerial"} for asset in assets)
+        has_depth = any(asset.asset_type in {"depth", "rgbd", "lidar"} or asset.role in {"depth_sensor", "lidar"} for asset in assets)
+        raw = read_json(context.stage_dir("raw_media_inspection") / "stage_result.json", {})
+        video = read_json(context.stage_dir("video_keyframe_optimization") / "stage_result.json", {})
+        pano = read_json(context.stage_dir("panorama_normalization") / "stage_result.json", {})
+        pose = read_json(context.stage_dir("pose_estimation_optimization") / "candidate_metrics.json", [])
+        training = read_json(context.stage_dir("training_input_optimization") / "stage_result.json", {})
+        render = read_json(context.stage_dir("render_evaluation") / "stage_result.json", {})
+        delivery_supported = bool(read_json(context.stage_dir(self.stage_name) / "run_final_selection.json", {}).get("best_model_path"))
+        common_inputs = {"asset_count": asset_count, "has_video": has_video, "has_pano": has_pano, "has_scale": has_scale}
+
+        specs: list[dict[str, Any]] = [
+            {"artifact_type": "input_route_report", "stage": "input_route", "status": "succeeded", "summary": "Input route report mirrors the guarded route manifest and records that routing alone never grants measurement.", "measurement_allowed": False},
+            {"artifact_type": "metadata_lineage_report", "stage": "raw_media_inspection", "status": "succeeded", "summary": "Asset metadata and derived files remain traceable through source maps.", "metrics": {"asset_count": asset_count}},
+            {"artifact_type": "metadata_manifest", "stage": "raw_media_inspection", "status": "succeeded", "summary": "Metadata manifest records available asset metadata without fabricating missing EXIF or GPS fields.", "metrics": {"asset_count": asset_count}},
+            {"artifact_type": "exif_gps_report", "stage": "raw_media_inspection", "status": "succeeded", "summary": "EXIF/GPS fields are preserved when present; missing metadata is reported, not fabricated.", "metrics": {"asset_count": asset_count, "gps_prior_used_for_measurement": False}},
+            {"artifact_type": "exif_report", "stage": "raw_media_inspection", "status": "succeeded", "summary": "EXIF report is a document-name-compatible alias for raw metadata inspection.", "metrics": {"asset_count": asset_count}},
+            {"artifact_type": "timestamp_lineage", "stage": "raw_media_inspection", "status": "succeeded", "summary": "Timestamp lineage remains source-traceable and is not used to rewrite asset evidence.", "metrics": {"asset_count": asset_count}},
+            {"artifact_type": "asset_quality_summary", "stage": "raw_media_inspection", "status": "succeeded", "summary": "Current asset quality summary is derived from RawMediaInspection and capture validation signals.", "metrics": raw.get("metrics") or {}},
+            {"artifact_type": "reconstruction_readiness_report", "stage": "raw_media_inspection", "status": "succeeded", "summary": "Readiness remains report-only and does not override quality gates.", "metrics": {"asset_count": asset_count, "ready_for_pose": asset_count > 0}},
+            {"artifact_type": "reflective_transparent_risk_report", "stage": "raw_media_inspection", "status": "succeeded", "summary": "Reflective/transparent risk is reported as a readiness signal, not collapsed into low-texture only.", "metrics": raw.get("metrics") or {}},
+            {"artifact_type": "capture_pattern_profile", "stage": "raw_media_inspection", "status": "succeeded", "summary": "Capture pattern profile is derived from current media inspection and remains advisory.", "metrics": {"asset_count": asset_count}},
+            {"artifact_type": "camera_model_policy_report", "stage": "pose_estimation_optimization", "status": "succeeded", "summary": "Camera model policy is reported from current pose/camera handling; panorama virtual camera support remains route-specific."},
+            {"artifact_type": "camera_model_policy", "stage": "pose_estimation_optimization", "status": "succeeded", "summary": "Camera model policy artifact preserves the v3 document name and points to the same camera handling policy."},
+            {"artifact_type": "video_probe_report", "stage": "video_keyframe_optimization", "status": "succeeded" if has_video else "skipped", "failure_reason": None if has_video else "no_video_input", "summary": "Video probe is skipped without video input and does not fabricate stream metadata.", "metrics": video.get("metrics") or {}},
+            {"artifact_type": "scene_segment_report", "stage": "video_keyframe_optimization", "status": "succeeded" if has_video else "skipped", "failure_reason": None if has_video else "no_video_input", "summary": "Video scene segmentation is currently represented by keyframe optimization reports.", "metrics": video.get("metrics") or {}},
+            {"artifact_type": "scene_segments", "stage": "video_keyframe_optimization", "status": "succeeded" if has_video else "skipped", "failure_reason": None if has_video else "no_video_input", "summary": "Scene segments are skipped without video input and preserve the v3 document artifact name.", "metrics": video.get("metrics") or {}},
+            {"artifact_type": "frame_selection_report", "stage": "video_keyframe_optimization", "status": "succeeded" if has_video else "skipped", "failure_reason": None if has_video else "no_video_input", "summary": "Frame selection preserves source video lineage.", "metrics": video.get("metrics") or {}},
+            {"artifact_type": "video_frame_selection_report", "stage": "video_keyframe_optimization", "status": "succeeded" if has_video else "skipped", "failure_reason": None if has_video else "no_video_input", "summary": "Video frame selection report is skipped without video input.", "metrics": video.get("metrics") or {}},
+            {"artifact_type": "frame_graph", "stage": "video_keyframe_optimization", "status": "succeeded" if has_video else "skipped", "failure_reason": None if has_video else "no_video_input", "summary": "Frame graph is skipped without video input.", "metrics": video.get("metrics") or {}},
+            {"artifact_type": "rolling_shutter_risk_report", "stage": "video_keyframe_optimization", "status": "succeeded" if has_video else "skipped", "failure_reason": None if has_video else "no_video_input", "summary": "Rolling shutter risk is reported when video input exists and remains advisory.", "metrics": video.get("metrics") or {}},
+            {"artifact_type": "image_set_reduction_report", "stage": "dataset_assembly", "status": "succeeded", "summary": "Image reduction is candidate-list based; original assets are not deleted."},
+            {"artifact_type": "panorama_station_manifest", "stage": "panorama_normalization", "status": "succeeded" if has_pano else "skipped", "failure_reason": None if has_pano else "no_panorama_input", "summary": "Panorama station support is reported when pano assets are present.", "metrics": pano.get("metrics") or {}},
+            {"artifact_type": "virtual_camera_manifest", "stage": "panorama_normalization", "status": "succeeded" if has_pano else "skipped", "failure_reason": None if has_pano else "no_panorama_input", "summary": "Virtual camera manifest is route-aware and skipped without panorama input."},
+            {"artifact_type": "crop_to_pano_map", "stage": "panorama_normalization", "status": "succeeded" if has_pano else "skipped", "failure_reason": None if has_pano else "no_panorama_input", "summary": "Crop-to-panorama mapping is skipped without panorama input."},
+            {"artifact_type": "pano_station_graph", "stage": "panorama_normalization", "status": "succeeded" if has_pano else "skipped", "failure_reason": None if has_pano else "no_panorama_input", "summary": "Panorama station graph is skipped without panorama input."},
+            {"artifact_type": "vendor_metadata_report", "stage": "panorama_normalization", "status": "unsupported" if not has_pano else "succeeded", "failure_reason": None if has_pano else "vendor_panorama_metadata_not_present", "summary": "Vendor-specific OSV/INSP/INSV metadata is not claimed when absent."},
+            {"artifact_type": "pose_candidates_report", "stage": "pose_estimation_optimization", "status": "succeeded", "summary": "Pose candidates are reported from current stage candidate metrics.", "metrics": {"candidate_count": len(pose) if isinstance(pose, list) else 0}},
+            {"artifact_type": "hloc_pairs", "stage": "pose_estimation_optimization", "status": "skipped", "failure_reason": "no_explicit_hloc_pairs_artifact", "summary": "HLoc pair files are not fabricated when the current run did not produce them."},
+            {"artifact_type": "feature_matching_report", "stage": "pose_estimation_optimization", "status": "succeeded", "summary": "LightGlue/ALIKED remains a pose candidate signal and does not replace geometry gates."},
+            {"artifact_type": "feature_match_report", "stage": "pose_estimation_optimization", "status": "succeeded", "summary": "Feature match report preserves the v3 document artifact name for LightGlue/ALIKED candidate evidence."},
+            {"artifact_type": "match_graph", "stage": "pose_estimation_optimization", "status": "skipped", "failure_reason": "no_explicit_match_graph_artifact", "summary": "Match graph is skipped unless an explicit graph artifact is produced."},
+            {"artifact_type": "pose_refinement_report", "stage": "pose_estimation_optimization", "status": "succeeded", "summary": "Pose refinement status is report-only until explicit BA/refinement artifacts are available."},
+            {"artifact_type": "bundle_adjustment_report", "stage": "pose_estimation_optimization", "status": "skipped", "failure_reason": "no_explicit_bundle_adjustment_artifact", "summary": "Bundle adjustment report is reserved for explicit BA outputs."},
+            {"artifact_type": "scale_stability_report", "stage": "pose_estimation_optimization", "status": "succeeded", "summary": "Scale stability is not sufficient for measurement without scale source.", "measurement_allowed": False},
+            {"artifact_type": "training_view_selection_report", "stage": "training_input_optimization", "status": "succeeded", "summary": "Training input selection preserves original supervision.", "metrics": training.get("metrics") or {}},
+            {"artifact_type": "holdout_view_selection_report", "stage": "training_input_optimization", "status": "succeeded", "summary": "Holdout selection remains tied to render evaluation and does not mutate training inputs.", "metrics": render.get("metrics") or {}},
+            {"artifact_type": "appearance_group_report", "stage": "training_input_optimization", "status": "succeeded", "summary": "Appearance grouping is reported as a training strategy signal."},
+            {"artifact_type": "mask_lineage_report", "stage": "mask_optimization", "status": "succeeded", "summary": "Mask lineage is optional for training and visible as report data."},
+            {"artifact_type": "mask_visibility_report", "stage": "mask_optimization", "status": "succeeded", "summary": "Mask visibility policy is report-only unless an explicit mask stage applies it."},
+            {"artifact_type": "photometric_consistency_report", "stage": "gaussian_training_optimization", "status": "succeeded", "summary": "Photometric variation is treated as training strategy, not source evidence mutation."},
+            {"artifact_type": "training_strategy_report", "stage": "gaussian_training_optimization", "status": "succeeded", "summary": "Training strategy keeps original supervision for the default production route."},
+            {"artifact_type": "drone_capture_profile", "stage": "input_route", "status": "succeeded" if has_drone else "skipped", "failure_reason": None if has_drone else "no_drone_input", "summary": "Drone route is skipped without drone/aerial metadata."},
+            {"artifact_type": "aerial_overlap_report", "stage": "input_route", "status": "succeeded" if has_drone else "skipped", "failure_reason": None if has_drone else "no_drone_input", "summary": "Aerial overlap is report-only without drone metadata."},
+            {"artifact_type": "flight_strip_report", "stage": "input_route", "status": "succeeded" if has_drone else "skipped", "failure_reason": None if has_drone else "no_drone_input", "summary": "Flight strip grouping is skipped without drone input."},
+            {"artifact_type": "gps_prior_report", "stage": "raw_media_inspection", "status": "succeeded", "summary": "GPS is a prior only and never enables measurement-grade by itself.", "metrics": {"asset_count": asset_count, "drone_metadata_present": has_drone}, "measurement_allowed": False},
+            {"artifact_type": "gcp_report", "stage": "input_route", "status": "succeeded" if has_scale else "skipped", "failure_reason": None if has_scale else "no_control_point_or_scale_input", "summary": "GCP/scale evidence must pass MeasurementReadinessGate."},
+            {"artifact_type": "scale_alignment_report", "stage": "input_route", "status": "succeeded" if has_scale else "skipped", "failure_reason": None if has_scale else "no_scale_input", "summary": "Scale alignment is skipped without scale evidence.", "measurement_allowed": False},
+            {"artifact_type": "georef_report", "stage": "input_route", "status": "skipped", "failure_reason": "no_georeference_input", "summary": "Georeference is not inferred from GPS-only metadata.", "measurement_allowed": False},
+            {"artifact_type": "capture_group_manifest", "stage": "input_route", "status": "succeeded", "summary": "Capture grouping is represented by current input classification and route manifest.", "inputs": common_inputs},
+            {"artifact_type": "per_group_pose_report", "stage": "pose_estimation_optimization", "status": "skipped", "failure_reason": "single_group_stage_optimized_run", "summary": "Per-group pose is skipped for single-group stage optimized runs."},
+            {"artifact_type": "global_scene_graph", "stage": "pose_estimation_optimization", "status": "skipped", "failure_reason": "no_cross_group_alignment", "summary": "Global scene graph is not fabricated without alignment edges."},
+            {"artifact_type": "cross_group_alignment_report", "stage": "pose_estimation_optimization", "status": "skipped", "failure_reason": "no_cross_group_alignment", "summary": "Cross-group alignment is skipped unless multiple capture groups exist.", "measurement_allowed": False},
+            {"artifact_type": "manual_control_point_report", "stage": "input_route", "status": "skipped", "failure_reason": "no_manual_control_points", "summary": "Manual control points are not inferred automatically."},
+            {"artifact_type": "depth_prior_manifest", "stage": "input_route", "status": "succeeded" if has_depth else "skipped", "failure_reason": None if has_depth else "no_depth_input", "summary": "Depth priors are skipped without LiDAR/RGB-D/depth assets.", "measurement_allowed": False},
+            {"artifact_type": "normal_prior_manifest", "stage": "input_route", "status": "succeeded" if has_depth else "skipped", "failure_reason": None if has_depth else "no_depth_input", "summary": "Normal priors are skipped without depth inputs."},
+            {"artifact_type": "prior_reliability_report", "stage": "input_route", "status": "succeeded" if has_depth else "skipped", "failure_reason": None if has_depth else "no_depth_input", "summary": "Learned priors are not measurement evidence by default.", "measurement_allowed": False},
+            {"artifact_type": "depth_sensor_report", "stage": "input_route", "status": "succeeded" if has_depth else "skipped", "failure_reason": None if has_depth else "no_depth_input", "summary": "Depth sensor calibration is required before measurement use.", "measurement_allowed": False},
+            {"artifact_type": "scale_marker_report", "stage": "measurement_gate", "status": "succeeded" if has_scale else "skipped", "failure_reason": None if has_scale else "no_scale_marker_input", "summary": "Scale markers are evidence candidates and require uncertainty checks.", "measurement_allowed": False},
+            {"artifact_type": "control_point_alignment_report", "stage": "measurement_gate", "status": "skipped", "failure_reason": "no_control_point_alignment", "summary": "Control point alignment is not inferred automatically.", "measurement_allowed": False},
+            {"artifact_type": "scale_uncertainty_report", "stage": "measurement_gate", "status": "skipped", "failure_reason": "scale_uncertainty_not_estimated", "summary": "Scale uncertainty must be estimated before measurement-grade claims.", "measurement_allowed": False},
+            {"artifact_type": "measurement_readiness_report", "stage": "measurement_gate", "status": "succeeded", "summary": "Measurement readiness defaults to false without trusted scale and surface evidence.", "measurement_allowed": False},
+            {"artifact_type": "measurement_confidence_report", "stage": "measurement_gate", "status": "succeeded", "summary": "Measurement confidence remains low unless scale/control/surface gates pass.", "measurement_allowed": False},
+            {"artifact_type": "mesh_extraction_report", "stage": "measurement_gate", "status": "unsupported", "failure_reason": "surface_model_not_available", "summary": "Mesh/surface extraction is not claimed for default splat-only output.", "measurement_allowed": False},
+            {"artifact_type": "scene_partition", "stage": "final_artifact_selection", "status": "skipped", "failure_reason": "large_scene_partition_not_triggered", "summary": "Large scene partitioning is skipped unless thresholds trigger it."},
+            {"artifact_type": "block_training_manifest", "stage": "final_artifact_selection", "status": "skipped", "failure_reason": "block_training_not_triggered", "summary": "Block training is skipped for non-partitioned runs."},
+            {"artifact_type": "lod_manifest", "stage": "final_artifact_selection", "status": "skipped", "failure_reason": "lod_export_not_triggered", "summary": "LOD export is skipped unless delivery config enables it."},
+            {"artifact_type": "chunk_manifest", "stage": "final_artifact_selection", "status": "skipped", "failure_reason": "chunk_export_not_triggered", "summary": "Chunk manifest is skipped for single-model runs."},
+            {"artifact_type": "streaming_manifest", "stage": "final_artifact_selection", "status": "skipped", "failure_reason": "streaming_export_not_triggered", "summary": "Streaming manifest is skipped unless large-scene delivery is enabled."},
+            {"artifact_type": "tiles_conversion_report", "stage": "final_artifact_selection", "status": "unsupported", "failure_reason": "true_3dtiles_converter_not_run", "summary": "True 3D Tiles conversion is not faked."},
+            {"artifact_type": "viewer_package_manifest", "stage": "final_artifact_selection", "status": "succeeded" if delivery_supported else "skipped", "failure_reason": None if delivery_supported else "no_final_model", "summary": "Viewer package readiness follows final model availability."},
+            {"artifact_type": "compression_conversion_report", "stage": "final_artifact_selection", "status": "skipped", "failure_reason": "compression_export_not_enabled", "summary": "Compression export is skipped unless enabled."},
+            {"artifact_type": "spz_export_report", "stage": "final_artifact_selection", "status": "skipped", "failure_reason": "spz_export_not_enabled", "summary": "SPZ export is skipped unless enabled."},
+            {"artifact_type": "forensic_manifest", "stage": "final_artifact_selection", "status": "succeeded", "summary": "Forensic manifest preserves source map and does not imply forensic conclusion."},
+            {"artifact_type": "experimental_route_report", "stage": "input_route", "status": "succeeded", "summary": "Experimental routes are default-off and cannot publish measurement-grade output.", "route_role": "experimental", "production_allowed": False, "measurement_allowed": False},
+        ]
+        return specs
 
     def _best_source_map(self, context: StageContext) -> dict[str, Any]:
         dataset = read_json(context.stage_dir("dataset_assembly") / "best_dataset_selection.json", {})

@@ -29,11 +29,26 @@ from app.workers.workflow_executor import execute_workflow
 router = APIRouter(tags=["workflows"])
 
 
+def _optimized_training_requested(config: dict) -> bool:
+    if config.get("execute_training") is not None:
+        return bool(config.get("execute_training"))
+    execution = config.get("execution") if isinstance(config.get("execution"), dict) else {}
+    training = config.get("training") if isinstance(config.get("training"), dict) else {}
+    if "execute_training_by_default" in execution:
+        return bool(execution.get("execute_training_by_default"))
+    if "execute_training_by_default" in training:
+        return bool(training.get("execute_training_by_default"))
+    stage_config = (get_settings().engine_config or {}).get("stage_optimized_reconstruction") or {}
+    stage_execution = stage_config.get("execution") if isinstance(stage_config.get("execution"), dict) else {}
+    stage_training = stage_config.get("training") if isinstance(stage_config.get("training"), dict) else {}
+    return bool(stage_execution.get("execute_training_by_default", False) or stage_training.get("execute_training_by_default", False))
+
+
 def _workflow_queue(workflow_type: str, config: dict) -> str:
     if is_capture_validation_workflow(workflow_type):
         return "preprocess"
     if workflow_type == OPTIMIZED_RECONSTRUCTION_TYPE:
-        return "nerfstudio" if config.get("execute_training") else "preprocess"
+        return "nerfstudio" if _optimized_training_requested(config) else "preprocess"
     if is_reconstruction_workflow(workflow_type):
         return "nerfstudio"
     if workflow_type == "pose_preflight_workflow" or config.get("preflight_only"):

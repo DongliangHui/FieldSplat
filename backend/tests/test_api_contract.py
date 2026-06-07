@@ -241,6 +241,7 @@ def test_asset_register_and_fake_nerfstudio_workflow(client, auth_headers, monke
         "mask_manifest",
         "spatial_crop_manifest",
         "gaussian_pruning_report",
+        "raw_model",
         "subject_model",
         "viewer_model",
         "context_model_lowres",
@@ -251,7 +252,7 @@ def test_asset_register_and_fake_nerfstudio_workflow(client, auth_headers, monke
         "artifacts_manifest",
         "run_summary",
     }.issubset(types)
-    primary_artifact = next(artifact for artifact in artifacts if artifact["artifact_type"] == "subject_model")
+    primary_artifact = next(artifact for artifact in artifacts if artifact["artifact_type"] == "raw_model")
     assert primary_artifact["is_primary"] is True
 
     command_report = next(artifact for artifact in artifacts if artifact["artifact_type"] == "command_report")
@@ -416,6 +417,7 @@ def test_fieldsplat_reconstruction_routes_inputs_and_exports_publish_package(cli
         "mask_manifest",
         "spatial_crop_manifest",
         "gaussian_pruning_report",
+        "raw_model",
         "subject_model",
         "viewer_model",
         "context_model_lowres",
@@ -431,7 +433,7 @@ def test_fieldsplat_reconstruction_routes_inputs_and_exports_publish_package(cli
     supersplat_artifact = next(artifact for artifact in artifacts if artifact["artifact_type"] == "supersplat_package")
     supersplat_package = client.get(f"/api/v1/artifacts/{supersplat_artifact['artifact_id']}/preview", headers=auth_headers).json()
     assert supersplat_package["optimization_status"] != "pending_external_supersplat_optimizer"
-    assert supersplat_package["raw_ply_is_final_product"] is False
+    assert supersplat_package["raw_ply_is_final_product"] is True
     tiles_artifact = next(artifact for artifact in artifacts if artifact["artifact_type"] == "3d_tiles_splat")
     tileset = client.get(f"/api/v1/artifacts/{tiles_artifact['artifact_id']}/preview", headers=auth_headers).json()
     assert tileset["conversion_status"]["status"].endswith("manifest_only")
@@ -516,6 +518,43 @@ def test_forced_colmap_route_does_not_directly_start_instantsplatpp_for_small_in
     assert stages["colmap_global_skeleton"]["status"] == "succeeded"
     assert stages["instantsplatpp_init"]["status"] == "skipped"
     assert stages["instantsplatpp_init"]["output_summary"]["trigger_status"] == "not_triggered"
+
+
+def test_sparse_photos_do_not_enter_instantsplatpp_direct_route_by_default(client, auth_headers) -> None:
+    import_dir = TEST_ROOT / "imports" / "default_small_colmap"
+    import_dir.mkdir(parents=True, exist_ok=True)
+    for index in range(6):
+        (import_dir / f"frame_{index:03d}.jpg").write_bytes(b"fake-jpeg")
+
+    project = client.post("/api/v1/projects", headers=auth_headers, json={"name": "Default small COLMAP"}).json()
+    project_id = project["project_id"]
+    registered = client.post(
+        f"/api/v1/projects/{project_id}/assets/register",
+        headers=auth_headers,
+        json={"path": str(import_dir), "asset_type": "detail_photo", "role": "global_skeleton"},
+    )
+    asset_ids = [item["asset_id"] for item in registered.json()["assets"]]
+
+    workflow = client.post(
+        f"/api/v1/projects/{project_id}/workflows",
+        headers=auth_headers,
+        json={
+            "workflow_type": "fieldsplat_reconstruction_workflow",
+            "input": {"asset_ids": asset_ids, "group_ids": []},
+            "config": {"profile": "quick_preview", "fake_runner": True},
+        },
+    )
+    assert workflow.status_code == 201
+    workflow_id = workflow.json()["workflow_id"]
+
+    state = client.get(f"/api/v1/workflows/{workflow_id}", headers=auth_headers).json()
+    stages = {stage["stage_key"]: stage for stage in state["stages"]}
+    assert state["quality"]["route_id"] == "route_001_colmap_splatfacto"
+    assert stages["input_route"]["output_summary"]["route_key"] == "colmap_splatfacto"
+    assert stages["input_route"]["output_summary"]["route_reason"] == "few_global_photo_inputs_colmap_guarded"
+    assert stages["input_route"]["output_summary"]["production_allowed"] is True
+    assert stages["pose_colmap_attempts"]["status"] == "succeeded"
+    assert stages["instantsplatpp_init"]["status"] == "skipped"
 
 
 def test_forced_mast3r_route_uses_mast3r_pose_before_training(client, auth_headers, monkeypatch) -> None:
@@ -669,7 +708,13 @@ def test_few_images_use_instantsplatpp_fallback(client, auth_headers) -> None:
         json={
             "workflow_type": "nerfstudio_3dgs_train",
             "input": {"asset_ids": asset_ids, "group_ids": []},
-            "config": {"profile": "quick_preview", "fallback_method": "instantsplatpp", "fake_runner": True, "enable_quality_gate": True},
+            "config": {
+                "profile": "quick_preview",
+                "fallback_method": "instantsplatpp",
+                "fake_runner": True,
+                "enable_quality_gate": True,
+                "algorithm": {"routing": {"allow_instantsplatpp_fallback_route": True}},
+            },
         },
     )
     workflow_id = workflow.json()["workflow_id"]
@@ -680,6 +725,7 @@ def test_few_images_use_instantsplatpp_fallback(client, auth_headers) -> None:
     assert any(stage["stage_key"] == "instantsplatpp_init" and stage["status"] == "succeeded" for stage in state["stages"])
     assert any(stage["stage_key"] == "camera_mapping_gate" and stage["status"] == "succeeded" for stage in state["stages"])
     assert any(stage["stage_key"] == "instantsplatpp_train" and stage["status"] == "succeeded" for stage in state["stages"])
+    assert state["quality"]["measurement_allowed"] is False
 
     artifacts = client.get(f"/api/v1/workflows/{workflow_id}/artifacts", headers=auth_headers).json()["artifacts"]
     types = {artifact["artifact_type"] for artifact in artifacts}

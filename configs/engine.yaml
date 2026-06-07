@@ -14,6 +14,12 @@ database:
 redis:
   url_env: REDIS_URL
 
+algorithm:
+  routing:
+    enable_instantsplatpp_direct_route: false
+    allow_instantsplatpp_preview_route: false
+    allow_instantsplatpp_fallback_route: false
+
 operators:
   colmap:
     enabled: true
@@ -194,6 +200,11 @@ operators:
     frame_diff_height: 64
     frame_diff_threshold: 28
     max_dynamic_ratio: 0.35
+    reflection_heuristic_max_images: 0
+    reflection_heuristic_max_coverage_ratio: 0.30
+    reflection_dark_value_threshold: 28
+    reflection_specular_value_threshold: 246
+    reflection_specular_saturation_threshold: 80
     # Optional semantic mask command. It must write JSON to {output_report}
     # and masks to {masks_dir}; if absent the worker uses ffmpeg frame diff.
     semantic_max_images: 180
@@ -300,8 +311,13 @@ operators:
   gaussian_pruning:
     enabled: true
     queue: export
+    publish_default: raw_model
     viewer_max_gaussians: 350000
     viewer_max_size_mb: 160
+    layered_loading:
+      enabled: true
+      preserve_raw_model: true
+      viewer_is_preview_proxy: true
 
   export:
     splat_transform:
@@ -458,13 +474,11 @@ stage_optimized_reconstruction:
   allow_super_resolution: false
   allow_deblur: true
   allow_denoise: true
-  force_original_images: false
   allow_mask: true
   allow_splatfacto_w: true
   allow_big_model: true
   max_gpu_hours: auto
   route_preset: safe_pose_original_train
-  execute_route_matrix: false
   safe_image_enhancement_routes:
     - denoise_light
     - exposure_normalized
@@ -473,17 +487,6 @@ stage_optimized_reconstruction:
     - white_balance_light
     - gamma_light
     - sharpen_light
-  route_matrix:
-    enabled: false
-    default_routes:
-      - original_pose_original_train
-      - safe_pose_original_train
-    benchmark_routes:
-      - original_pose_original_train
-      - safe_pose_original_train
-    selection:
-      prefer_original_training_when_close: true
-      close_score_epsilon: 0.015
   image:
     min_width_px: 1200
     min_height_px: 900
@@ -526,16 +529,17 @@ stage_optimized_reconstruction:
     max_static_structure_damage_score: 0.10
     max_feature_loss_score: 0.25
   training:
-    execute_training_by_default: false
+    execute_training_by_default: true
     fake_runner: false
     quick_probe_steps: 300
-    standard_steps: 10000
+    standard_steps: 30000
     final_steps: 30000
+    long_train_steps: 60000
     min_meaningful_gain: 0.03
   execution:
-    execute_pose_estimation_by_default: false
-    execute_mask_optimization_by_default: false
-    execute_training_by_default: false
+    execute_pose_estimation_by_default: true
+    execute_mask_optimization_by_default: true
+    execute_training_by_default: true
     execute_all_route_candidates: false
   route_catalog:
     image_enhancement:
@@ -568,7 +572,6 @@ stage_optimized_reconstruction:
       - perspective_views_dense
       - panorama_as_context_only
     dataset_assembly:
-      - original_pose_original_train
       - safe_pose_original_train
       - jpg_only_best_pose
       - video_only_best_keyframes
@@ -577,8 +580,6 @@ stage_optimized_reconstruction:
       - jpg_video_fused_sparse
       - panorama_context_added
       - high_confidence_only
-      - enhanced_pose_original_texture
-      - enhanced_pose_enhanced_texture
     pose_estimation:
       - colmap_exhaustive
       - colmap_sequential
@@ -598,10 +599,6 @@ stage_optimized_reconstruction:
       - aggressive_mask
     training_input:
       - original_training_images
-      - enhanced_training_images
-      - exposure_normalized_training_images
-      - denoise_training_images
-      - mixed_training_images
       - resize_native
       - resize_balanced
       - balanced_holdout_split
@@ -627,12 +624,17 @@ stage_optimized_reconstruction:
       - mask_vs_no_mask_comparison
       - enhanced_vs_original_comparison
   real_pose_candidates:
+    - colmap_hybrid
+    - hloc_lightglue_aliked_fallback
+    - colmap_exhaustive
     - colmap_sequential
   real_training_candidates:
-    - splatfacto_baseline
+    - splatfacto_long_train
+    - splatfacto_big
+    - splatfacto_high_resolution
   adapters:
     hloc_lightglue_aliked:
-      enabled: false
+      enabled: true
     mast3r_dust3r:
       enabled: false
     sam2:
@@ -654,10 +656,14 @@ reconstruction_scope:
   background_loss_weight: 0.15
   prune_background_gaussians: true
   export_full_debug_model: true
-  publish_default: subject_model
+  publish_default: raw_model
   foreground_ratio: 0.68
   viewer_max_gaussians: 350000
   viewer_max_size_mb: 160
+  layered_loading:
+    enabled: true
+    preserve_raw_model: true
+    viewer_is_preview_proxy: true
   apply_masks_to_colmap: false
   apply_masks_to_training: false
 
@@ -841,6 +847,8 @@ fieldsplat_defaults_v0_1:
         max_num_iterations: 10000
       high_quality:
         max_num_iterations: 30000
+        use_bilateral_grid: true
+        color_corrected_metrics: true
       forensic_max_quality:
         max_num_iterations: 60000
         train_cameras_sampling_strategy: fps

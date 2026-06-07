@@ -8,6 +8,14 @@ import yaml
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+@lru_cache(maxsize=16)
+def _load_engine_config(path_value: str, mtime_ns: int, size_bytes: int) -> dict[str, Any]:
+    path = Path(path_value)
+    with path.open("r", encoding="utf-8") as fh:
+        loaded = yaml.safe_load(fh) or {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
 class Settings(BaseSettings):
     app_env: str = "development"
     api_v1_prefix: str = "/api/v1"
@@ -61,9 +69,8 @@ class Settings(BaseSettings):
         path = Path(self.engine_config_path)
         if not path.exists():
             return {}
-        with path.open("r", encoding="utf-8") as fh:
-            loaded = yaml.safe_load(fh) or {}
-        return loaded
+        stat = path.stat()
+        return _load_engine_config(str(path), stat.st_mtime_ns, stat.st_size)
 
     @property
     def import_roots(self) -> list[Path]:

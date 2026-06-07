@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import shutil
+import struct
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -75,7 +77,7 @@ class ColmapGlobalSkeletonOperator:
                 "image_count": len(preprocess.image_paths),
                 "subject_mask": _mask_cache_payload(subject_mask),
             },
-            algorithm_version="colmap-global-skeleton-v5-largest-component",
+            algorithm_version="colmap-global-skeleton-v6-matcher-gpu-config",
         )
         if cache_entry.hit and cache.restore(cache_entry, workspace_dir) and (text_model_dir / "images.txt").exists():
             result = _build_result(
@@ -144,7 +146,7 @@ class ColmapGlobalSkeletonOperator:
                 )
             ]
         _raise_on_failed(commands[-1])
-        matcher_command = _matcher_command(binary, matcher, database_path, config, attempt_spec=attempt_spec)
+        matcher_command = _matcher_command(binary, matcher, database_path, config, attempt_spec=attempt_spec, shared=shared)
         commands.append(
             _run_command(
                 "colmap.global_skeleton",
@@ -547,8 +549,17 @@ def _mapper_command(binary: str, database_path: Path, images_dir: Path, sparse_d
     ]
 
 
-def _matcher_command(binary: str, matcher: str, database_path: Path, config: dict[str, Any], *, attempt_spec: dict[str, Any] | None = None) -> list[str]:
+def _matcher_command(
+    binary: str,
+    matcher: str,
+    database_path: Path,
+    config: dict[str, Any],
+    *,
+    attempt_spec: dict[str, Any] | None = None,
+    shared: dict[str, Any] | None = None,
+) -> list[str]:
     attempt_spec = attempt_spec or {}
+    shared = shared or {}
     if matcher == "imported":
         match_list_path = attempt_spec.get("colmap_match_list_path") or attempt_spec.get("match_list_path")
         if not match_list_path:
@@ -579,17 +590,19 @@ def _matcher_command(binary: str, matcher: str, database_path: Path, config: dic
             "--SequentialMatching.overlap",
             str(int(attempt_spec.get("sequential_overlap", config.get("sequential_overlap", 20)))),
         ]
+        _append_sift_matching_options(command, shared=shared)
         if loop_detection_enabled:
             command.extend(["--SequentialMatching.vocab_tree_path", str(vocab_tree_path)])
         return command
     if matcher == "vocabtree":
         command = [binary, "vocab_tree_matcher", "--database_path", str(database_path)]
+        _append_sift_matching_options(command, shared=shared)
         vocab_tree_path = config.get("vocab_tree_path")
         if vocab_tree_path:
             command.extend(["--VocabTreeMatching.vocab_tree_path", str(vocab_tree_path)])
         return command
     if matcher == "spatial":
-        return [
+        command = [
             binary,
             "spatial_matcher",
             "--database_path",
@@ -597,7 +610,15 @@ def _matcher_command(binary: str, matcher: str, database_path: Path, config: dic
             "--SpatialMatching.max_num_neighbors",
             str(int(attempt_spec.get("max_num_neighbors", config.get("spatial_max_num_neighbors", 50)))),
         ]
-    return [binary, "exhaustive_matcher", "--database_path", str(database_path)]
+        _append_sift_matching_options(command, shared=shared)
+        return command
+    command = [binary, "exhaustive_matcher", "--database_path", str(database_path)]
+    _append_sift_matching_options(command, shared=shared)
+    return command
+
+
+def _append_sift_matching_options(command: list[str], *, shared: dict[str, Any]) -> None:
+    command.extend(["--SiftMatching.use_gpu", "1" if _bool_colmap_value(shared.get("use_gpu", True)) else "0"])
 
 
 def _bool_colmap_value(value: Any) -> bool:
@@ -610,7 +631,9 @@ def _bool_colmap_value(value: Any) -> bool:
 
 def _run_command(operator_name: str, stage_key: str, command: list[str], cwd: Path) -> CommandResult:
     started = datetime.now(timezone.utc)
-    completed = subprocess.run(command, cwd=cwd, capture_output=True, text=True, check=False)
+    env = os.environ.copy()
+    env.setdefault("QT_QPA_PLATFORM", "offscreen")
+    completed = subprocess.run(command, cwd=cwd, capture_output=True, text=True, check=False, env=env)
     finished = datetime.now(timezone.utc)
     return CommandResult(
         operator_name=operator_name,
@@ -647,15 +670,29 @@ def _colmap_model_dir_score(model_dir: Path) -> tuple[int, int, int, str]:
     else:
         images_bin = model_dir / "images.bin"
         if images_bin.exists():
-            registered_images = images_bin.stat().st_size
+            registered_images = _colmap_binary_record_count(images_bin) or images_bin.stat().st_size
     if points_txt.exists():
         sparse_points = len(_parse_points3d(points_txt))
     else:
         points_bin = model_dir / "points3D.bin"
         if points_bin.exists():
-            sparse_points = points_bin.stat().st_size
+            sparse_points = _colmap_binary_record_count(points_bin) or points_bin.stat().st_size
     cameras_size = (model_dir / "cameras.bin").stat().st_size if (model_dir / "cameras.bin").exists() else 0
     return registered_images, sparse_points, cameras_size, model_dir.name
+
+
+def _colmap_binary_record_count(path: Path) -> int | None:
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(8)
+    except OSError:
+        return None
+    if len(header) != 8:
+        return None
+    count = struct.unpack("<Q", header)[0]
+    if count > 100_000_000:
+        return None
+    return int(count)
 
 
 def _parse_cameras(path: Path) -> dict[int, dict[str, Any]]:

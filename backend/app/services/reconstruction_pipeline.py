@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.models import Asset, Workflow
 from app.services.artifact_service import ArtifactService
+from app.operators.qc.reconstruction_gates import evaluate_measurement_gate
 from app.services.stage_optimizer import (
     DEFAULT_PRODUCTION_ROUTE_PRESET,
     DatasetAssemblyStage,
@@ -18,8 +18,6 @@ from app.services.stage_optimizer import (
     ImageEnhancementStage,
     MaskOptimizationStage,
     OPTIMIZED_STAGE_NAMES,
-    ROUTE_PRESETS,
-    ROUTE_SCOPED_STAGE_NAMES,
     PanoramaNormalizationStage,
     PoseEstimationOptimizationStage,
     RawMediaInspectionStage,
@@ -94,6 +92,8 @@ def _build_config(workflow: Workflow) -> dict[str, Any]:
     if not isinstance(stage_config, dict):
         stage_config = {}
     config = _deep_merge(stage_config, workflow.config_json or {})
+    execution_config = config.get("execution") if isinstance(config.get("execution"), dict) else {}
+    training_config = config.get("training") if isinstance(config.get("training"), dict) else {}
     config.setdefault("preserve_forensic_integrity", True)
     config.setdefault("stop_when_stage_optimal", True)
     config.setdefault("allow_ai_enhance", False)
@@ -103,8 +103,11 @@ def _build_config(workflow: Workflow) -> dict[str, Any]:
     config.setdefault("allow_mask", True)
     config.setdefault("allow_splatfacto_w", True)
     config.setdefault("allow_big_model", True)
-    config.setdefault("route_preset", DEFAULT_PRODUCTION_ROUTE_PRESET)
-    config.setdefault("execute_route_matrix", False)
+    if config.get("execute_pose_estimation") is None:
+        config["execute_pose_estimation"] = bool(execution_config.get("execute_pose_estimation_by_default", False))
+    if config.get("execute_training") is None:
+        config["execute_training"] = bool(execution_config.get("execute_training_by_default", False) or training_config.get("execute_training_by_default", False))
+    config["route_preset"] = DEFAULT_PRODUCTION_ROUTE_PRESET
     return config
 
 
@@ -116,6 +119,36 @@ def _load_assets(db: Session, workflow: Workflow) -> list[Asset]:
     assets = db.query(Asset).filter(Asset.id.in_(asset_ids), Asset.project_id == workflow.project_id).all()
     by_id = {asset.id: asset for asset in assets}
     return [by_id[asset_id] for asset_id in asset_ids if asset_id in by_id]
+
+
+def _scale_input_count(assets: list[Asset]) -> int:
+    return sum(1 for asset in assets if asset.asset_type == "scale_marker" or asset.role in {"scale_marker", "measurement_marker", "scale_reference"})
+
+
+def _stage_optimized_pose_quality(final_results: dict[str, dict[str, Any]], quality_level: str) -> dict[str, Any]:
+    pose_result = final_results.get("pose_estimation_optimization") or {}
+    metrics = pose_result.get("metrics") if isinstance(pose_result, dict) else {}
+    if not isinstance(metrics, dict):
+        metrics = {}
+    rejected = bool(pose_result.get("rejected_reason")) if isinstance(pose_result, dict) else False
+    not_ready = str(quality_level).lower() in {"d", "not_ready", "failed"}
+    return {
+        "passed": not rejected and not not_ready,
+        "visual_quality_level": quality_level,
+        "registered_ratio": metrics.get("registered_ratio") or metrics.get("registration_rate"),
+        "mean_reprojection_error": metrics.get("mean_reprojection_error"),
+        "source": "stage_optimized_reconstruction",
+    }
+
+
+def _stage_measurement_readiness(*, assets: list[Asset], final_results: dict[str, dict[str, Any]], quality_level: str, mode: str) -> dict[str, Any]:
+    return evaluate_measurement_gate(
+        scale_input_count=_scale_input_count(assets),
+        pose_quality=_stage_optimized_pose_quality(final_results, quality_level),
+        mode=mode,
+        visual_quality_level=quality_level,
+        surface_model_available=False,
+    )
 
 
 def _write_status(context: StageContext, status: dict[str, Any]) -> None:
@@ -138,130 +171,6 @@ def _stage_artifact_paths_for_context(context: StageContext, stage_name: str) ->
         "stage_report": str(stage_dir / "stage_report.md"),
         "candidate_metrics": str(stage_dir / "candidate_metrics.json"),
     }
-
-
-def _route_set(config: dict[str, Any]) -> list[str]:
-    matrix = config.get("route_matrix") if isinstance(config.get("route_matrix"), dict) else {}
-    if config.get("benchmark_mode") or matrix.get("benchmark_mode"):
-        requested = matrix.get("benchmark_routes") or ["original_pose_original_train", "safe_pose_original_train"]
-    else:
-        requested = matrix.get("default_routes") or ["original_pose_original_train", "safe_pose_original_train"]
-    routes = [str(route) for route in requested if str(route) in ROUTE_PRESETS]
-    return routes or ["original_pose_original_train", "safe_pose_original_train"]
-
-
-def _ply_vertex_count(path: Path) -> int | None:
-    if not path.exists():
-        return None
-    with path.open("rb") as handle:
-        header = b""
-        while b"end_header" not in header:
-            line = handle.readline()
-            if not line:
-                break
-            header += line
-    match = re.search(rb"element vertex (\d+)", header)
-    return int(match.group(1)) if match else None
-
-
-def _route_metrics(context: StageContext, route: str) -> dict[str, Any]:
-    previous_route = context.config.get("active_route_id")
-    previous_preset = context.config.get("active_route_preset")
-    context.config["active_route_id"] = route
-    context.config["active_route_preset"] = route
-    try:
-        pose = load_optimized_json_for_path(context.stage_dir("pose_estimation_optimization") / "best_pose_selection.json", {})
-        pose_metrics = pose.get("metrics") or {}
-        training = load_optimized_json_for_path(context.stage_dir("gaussian_training_optimization") / "best_training_selection.json", {})
-        training_metrics = training.get("metrics") or {}
-        render = load_optimized_json_for_path(context.stage_dir("render_evaluation") / "eval_metrics.json", {})
-        final = load_optimized_json_for_path(context.stage_dir("final_artifact_selection") / "run_final_selection.json", {})
-        ply_path_value = final.get("best_model_path") or training.get("splat_path") or training_metrics.get("splat_path")
-        ply_path = Path(str(ply_path_value)) if ply_path_value else None
-        registered = pose_metrics.get("registered_images_count")
-        total = pose_metrics.get("total_images_count")
-        return {
-            "route_preset": route,
-            "registered_images": f"{registered}/{total}" if registered is not None and total is not None else None,
-            "registered_images_count": registered,
-            "total_images_count": total,
-            "registration_ratio": pose_metrics.get("registered_ratio"),
-            "reprojection_error_px": pose_metrics.get("mean_reprojection_error"),
-            "sparse_points": pose_metrics.get("sparse_points_count"),
-            "psnr": render.get("PSNR") or training_metrics.get("final_eval_psnr"),
-            "ssim": render.get("SSIM") or training_metrics.get("final_eval_ssim"),
-            "lpips": render.get("LPIPS") or training_metrics.get("final_eval_lpips"),
-            "gaussian_count": training_metrics.get("gaussian_count"),
-            "ply_size_mb": round(ply_path.stat().st_size / 1024 / 1024, 1) if ply_path and ply_path.exists() else None,
-            "ply_vertex_count": _ply_vertex_count(ply_path) if ply_path else None,
-            "final_score": final.get("final_score"),
-            "quality_level": final.get("quality_level"),
-            "best_model_path": str(ply_path) if ply_path else None,
-            "training_supervision_modified": bool(training_metrics.get("training_supervision_modified")),
-        }
-    finally:
-        if previous_route is None:
-            context.config.pop("active_route_id", None)
-        else:
-            context.config["active_route_id"] = previous_route
-        if previous_preset is None:
-            context.config.pop("active_route_preset", None)
-        else:
-            context.config["active_route_preset"] = previous_preset
-
-
-def load_optimized_json_for_path(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return default
-
-
-def _select_best_route(metrics_table: dict[str, dict[str, Any]]) -> tuple[str | None, list[str]]:
-    baseline = metrics_table.get("original_pose_original_train") or {}
-    candidates = {name: metrics for name, metrics in metrics_table.items() if name != "original_pose_original_train"}
-    baseline_ratio = float(baseline.get("registration_ratio") or 0.0)
-    eligible = {
-        name: metrics
-        for name, metrics in candidates.items()
-        if float(metrics.get("registration_ratio") or 0.0) >= baseline_ratio
-    }
-    if not eligible:
-        return ("original_pose_original_train" if baseline else None, ["no_candidate_met_baseline_registration_ratio"])
-
-    def rank(item: tuple[str, dict[str, Any]]) -> tuple[float, float, float, float, float, float]:
-        name, metrics = item
-        final_score = float(metrics.get("final_score") or 0.0)
-        psnr = float(metrics.get("psnr") or 0.0)
-        ssim = float(metrics.get("ssim") or 0.0)
-        lpips = float(metrics.get("lpips") or 1.0)
-        reproj = float(metrics.get("reprojection_error_px") or 999.0)
-        supervision_penalty = 0.015 if metrics.get("training_supervision_modified") else 0.0
-        return (final_score - supervision_penalty, -reproj, psnr, ssim, -lpips, 0.0 if metrics.get("training_supervision_modified") else 1.0)
-
-    best_name, best_metrics = max(eligible.items(), key=rank)
-    if baseline and float(baseline.get("final_score") or 0.0) > float(best_metrics.get("final_score") or 0.0):
-        return "original_pose_original_train", ["baseline_final_score_higher_than_safe_candidates"]
-    reasons = []
-    if float(best_metrics.get("registration_ratio") or 0.0) >= baseline_ratio:
-        reasons.append("registration_ratio_equal_or_above_baseline")
-    if baseline.get("reprojection_error_px") is not None and best_metrics.get("reprojection_error_px") is not None and float(best_metrics["reprojection_error_px"]) < float(baseline["reprojection_error_px"]):
-        reasons.append("reprojection_error_improved")
-    if float(best_metrics.get("psnr") or 0.0) > float(baseline.get("psnr") or 0.0):
-        reasons.append("PSNR_improved")
-    if float(best_metrics.get("ssim") or 0.0) > float(baseline.get("ssim") or 0.0):
-        reasons.append("SSIM_improved")
-    if baseline.get("lpips") is not None and best_metrics.get("lpips") is not None and float(best_metrics["lpips"]) < float(baseline["lpips"]):
-        reasons.append("LPIPS_improved")
-    if float(best_metrics.get("final_score") or 0.0) > float(baseline.get("final_score") or 0.0):
-        reasons.append("final_score_improved")
-    if not best_metrics.get("training_supervision_modified"):
-        reasons.append("training_supervision_remains_original")
-    else:
-        reasons.append("training_supervision_modified")
-    return best_name, reasons
 
 
 def _run_optimizer_stage(
@@ -360,142 +269,6 @@ def _run_optimizer_stage(
     return result
 
 
-def _run_route_matrix_reconstruction(db: Session, workflow: Workflow, context: StageContext, capability_report: dict[str, Any]) -> dict[str, Any]:
-    record_store = RunRecordStore(context.run_dir)
-    assets = context.assets
-    routes = _route_set(context.config)
-    common_stage_names = [name for name in OPTIMIZED_STAGE_NAMES if name not in ROUTE_SCOPED_STAGE_NAMES]
-    route_stage_names = [name for name in OPTIMIZED_STAGE_NAMES if name in ROUTE_SCOPED_STAGE_NAMES]
-    total_units = len(common_stage_names) + len(routes) * len(route_stage_names)
-    completed_units = 0
-    common_results: dict[str, Any] = {}
-    append_workflow_log(
-        db,
-        workflow_id=workflow.id,
-        message="Stage optimized route matrix started",
-        event={"event_type": "optimized_reconstruction.route_matrix_started", "asset_count": len(assets), "routes": routes},
-    )
-    db.commit()
-    context.config.pop("active_route_id", None)
-    context.config.pop("active_route_preset", None)
-    context.previous_results = {}
-    for stage_name in common_stage_names:
-        result = _run_optimizer_stage(
-            db,
-            workflow,
-            context,
-            record_store,
-            capability_report,
-            stage_name,
-            stage_index=completed_units + 1,
-            stage_count=total_units,
-            progress_base=completed_units / max(total_units, 1),
-        )
-        completed_units += 1
-        if result.get("status") != "succeeded":
-            return workflow.quality_json or {}
-        common_results[stage_name] = result
-
-    route_results: dict[str, dict[str, Any]] = {}
-    for route in routes:
-        context.config["active_route_id"] = route
-        context.config["active_route_preset"] = route
-        context.config["route_preset"] = route
-        context.previous_results = dict(common_results)
-        route_results[route] = {}
-        append_workflow_log(
-            db,
-            workflow_id=workflow.id,
-            message=f"Stage optimized route started: {route}",
-            event={"event_type": "optimized_reconstruction.route_started", "route": route},
-        )
-        db.commit()
-        for stage_name in route_stage_names:
-            result = _run_optimizer_stage(
-                db,
-                workflow,
-                context,
-                record_store,
-                capability_report,
-                stage_name,
-                stage_index=completed_units + 1,
-                stage_count=total_units,
-                progress_base=completed_units / max(total_units, 1),
-            )
-            completed_units += 1
-            route_results[route][stage_name] = result
-            if result.get("status") != "succeeded":
-                return workflow.quality_json or {}
-
-    metrics_table = {route: _route_metrics(context, route) for route in routes}
-    best_route, reasons = _select_best_route(metrics_table)
-    comparison = {
-        "baseline_route": "original_pose_original_train",
-        "candidate_routes": [route for route in routes if route != "original_pose_original_train"],
-        "best_route": best_route,
-        "reason": reasons,
-        "metrics_table": metrics_table,
-    }
-    comparison_dir = context.run_dir / "route_matrix"
-    comparison_path = write_json(comparison_dir / "route_comparison.json", comparison)
-    artifact_service = context.artifact_service
-    artifact_service.register_file(
-        project_id=workflow.project_id,
-        workflow_id=workflow.id,
-        artifact_type="route_comparison",
-        stage="route_matrix",
-        relative_path=f"optimized_runs/{workflow.id}/route_matrix/route_comparison.json",
-        source_path=str(comparison_path),
-        mime_type="application/json",
-        is_primary=True,
-    )
-    best_metrics = metrics_table.get(best_route or "", {})
-    workflow.status = "completed"
-    workflow.progress = 1.0
-    workflow.quality_json = {
-        **(workflow.quality_json or {}),
-        "quality_grade": best_metrics.get("quality_level") or "production_candidate",
-        "measurement_allowed": False,
-        "stage_optimized_reconstruction": {
-            "status": workflow.status,
-            "route_matrix": True,
-            "best_route": best_route,
-            "final_score": best_metrics.get("final_score"),
-            "quality_level": best_metrics.get("quality_level"),
-            "best_model": best_metrics.get("best_model_path"),
-            "route_comparison": str(comparison_path),
-            "stage_count": total_units,
-            "records": record_store.read_all(),
-            "capability_report": capability_report,
-        },
-    }
-    _write_status(
-        context,
-        {
-            "workflow_id": workflow.id,
-            "status": workflow.status,
-            "current_stage": None,
-            "route_matrix": True,
-            "best_route": best_route,
-            "final_score": best_metrics.get("final_score"),
-            "quality_level": best_metrics.get("quality_level"),
-            "best_model": best_metrics.get("best_model_path"),
-            "route_comparison": str(comparison_path),
-            "routes": routes,
-            "metrics_table": metrics_table,
-            "records": record_store.read_all(),
-        },
-    )
-    append_workflow_log(
-        db,
-        workflow_id=workflow.id,
-        message="Stage optimized route matrix completed",
-        event={"event_type": "optimized_reconstruction.route_matrix_completed", "best_route": best_route, "final_score": best_metrics.get("final_score")},
-    )
-    db.commit()
-    return workflow.quality_json
-
-
 def run_stage_optimized_reconstruction(
     db: Session,
     workflow_id: str,
@@ -574,10 +347,6 @@ def run_stage_optimized_reconstruction(
         )
         db.commit()
         return workflow.quality_json
-
-    route_matrix_config = config.get("route_matrix") if isinstance(config.get("route_matrix"), dict) else {}
-    if only_stage is None and bool(config.get("execute_route_matrix") or route_matrix_config.get("enabled")):
-        return _run_route_matrix_reconstruction(db, workflow, context, capability_report)
 
     stage_names = [only_stage] if only_stage else list(OPTIMIZED_STAGE_NAMES)
     final_results: dict[str, Any] = {}
@@ -757,6 +526,12 @@ def run_stage_optimized_reconstruction(
     final_metrics = final_selection.get("metrics", {}) if isinstance(final_selection, dict) else {}
     final_score = float(final_metrics.get("final_score", 0.0) or 0.0)
     quality_level = final_metrics.get("quality_level") or ("B" if final_score >= 0.7 else "C" if final_score >= 0.45 else "D")
+    measurement_readiness = _stage_measurement_readiness(
+        assets=assets,
+        final_results=final_results,
+        quality_level=str(quality_level),
+        mode=str(config.get("mode") or config.get("profile") or "standard"),
+    )
     best_model_path = final_metrics.get("best_model_path")
     if not best_model_path:
         final_selection_path = run_dir / "stages" / "final_artifact_selection" / "run_final_selection.json"
@@ -770,11 +545,14 @@ def run_stage_optimized_reconstruction(
     workflow.quality_json = {
         **(workflow.quality_json or {}),
         "quality_grade": quality_level,
-        "measurement_allowed": quality_level == "A",
+        "measurement_allowed": bool(measurement_readiness.get("measurement_allowed")),
+        "measurement_readiness": measurement_readiness,
+        "measurement_gate": measurement_readiness,
         "stage_optimized_reconstruction": {
             "status": workflow.status,
             "final_score": final_score,
             "quality_level": quality_level,
+            "measurement_gate": measurement_readiness,
             "best_model": best_model_path,
             "stage_count": len(stage_names),
             "records": record_store.read_all(),
@@ -789,6 +567,7 @@ def run_stage_optimized_reconstruction(
             "current_stage": None,
             "final_score": final_score,
             "quality_level": quality_level,
+            "measurement_gate": measurement_readiness,
             "best_model": best_model_path,
             "stages": list(context.previous_results.values()),
             "records": record_store.read_all(),

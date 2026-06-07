@@ -27,13 +27,18 @@ DEFAULT_SCOPE_CONFIG: dict[str, Any] = {
     "background_loss_weight": 0.15,
     "prune_background_gaussians": True,
     "export_full_debug_model": True,
-    "publish_default": "subject_model",
+    "publish_default": "raw_model",
     "foreground_ratio": 0.68,
     "apply_masks_to_colmap": False,
     "apply_masks_to_training": False,
     "max_generated_masks": 1200,
     "viewer_max_gaussians": 350_000,
     "viewer_max_size_mb": 160,
+    "layered_loading": {
+        "enabled": True,
+        "preserve_raw_model": True,
+        "viewer_is_preview_proxy": True,
+    },
 }
 
 
@@ -210,6 +215,7 @@ class GaussianPruningOperator:
         )
         report_path = workspace_dir / "gaussian_pruning_report.json"
         output_names = {
+            "raw_model": "raw_model.ply",
             "model_full": "model_full.ply",
             "model_roi": "model_roi.ply",
             "subject_model": "subject_model.ply",
@@ -253,6 +259,8 @@ class GaussianPruningOperator:
         )
         sizes = {key: _size_payload(path) for key, path in outputs.items() if path.exists()}
         cleanup_summary = pruning_summary.get("scale_outlier_cleanup") or {}
+        raw_gaussian_count = pruning_summary.get("raw_gaussian_count") or pruning_summary.get("source_gaussian_count")
+        layered_loading = _layered_loading_payload(scope_config, outputs, sizes, pruning_summary)
         report = {
             "workflow_id": workflow.id,
             "operator": self.name,
@@ -261,8 +269,11 @@ class GaussianPruningOperator:
             "reconstruction_scope": scope_config["reconstruction_scope"],
             "publish_default": scope_config["publish_default"],
             "viewer_default": "viewer_model",
+            "viewer_model_role": "preview_proxy",
+            "quality_model_not_capped_for_viewer": True,
             "viewer_max_gaussians": viewer_max_gaussians,
             "viewer_max_size_mb": viewer_max_size_mb,
+            "layered_loading": layered_loading,
             "preserve_context": bool(scope_config["preserve_context"]),
             "context_quality": scope_config["context_quality"],
             "foreground_ratio": round(foreground_ratio, 4),
@@ -277,9 +288,11 @@ class GaussianPruningOperator:
             "scale_outlier_cleanup": cleanup_summary,
             "pruned_gaussian_count": pruning_summary.get("pruned_gaussian_count", 0),
             "source_gaussian_count": pruning_summary.get("source_gaussian_count"),
+            "raw_gaussian_count": raw_gaussian_count,
             "subject_gaussian_count": pruning_summary.get("subject_gaussian_count"),
             "viewer_gaussian_count": pruning_summary.get("viewer_gaussian_count"),
             "context_gaussian_count": pruning_summary.get("context_gaussian_count"),
+            "raw_model_size": sizes.get("raw_model", {}),
             "final_subject_model_size": sizes.get("subject_model", {}),
             "viewer_model_size": sizes.get("viewer_model", {}),
             "context_model_size": sizes.get("context_model_lowres", {}),
@@ -584,6 +597,7 @@ def _write_layered_ply_outputs(
 ) -> dict[str, Any]:
     for path in outputs.values():
         path.parent.mkdir(parents=True, exist_ok=True)
+    _link_or_copy(source, outputs["raw_model"])
     _link_or_copy(source, outputs["full_model_debug"])
     working_source = source
     cleanup_summary = {"triggered": False, "applied": False, "reason": "not_required"}
@@ -602,6 +616,7 @@ def _write_layered_ply_outputs(
     parsed.update(
         {
             "scale_outlier_cleanup": cleanup_summary,
+            "raw_gaussian_count": parsed.get("source_gaussian_count"),
             "viewer_gaussian_count": viewer_summary.get("viewer_gaussian_count"),
             "viewer_sampling_mode": viewer_summary.get("mode"),
             "viewer_sampling_step": viewer_summary.get("sampling_step"),
@@ -609,6 +624,63 @@ def _write_layered_ply_outputs(
     )
     parsed.setdefault("notes", []).extend(viewer_summary.get("notes", []))
     return parsed
+
+
+def _layered_loading_payload(
+    scope_config: dict[str, Any],
+    outputs: dict[str, Path],
+    sizes: dict[str, dict[str, Any]],
+    pruning_summary: dict[str, Any],
+) -> dict[str, Any]:
+    layered_config = scope_config.get("layered_loading") or {}
+    enabled = layered_config.get("enabled", True) is not False
+    layers = [
+        {
+            "id": "viewer_model",
+            "role": "interactive_preview",
+            "path": str(outputs["viewer_model"]),
+            "gaussian_count": pruning_summary.get("viewer_gaussian_count"),
+            "size": sizes.get("viewer_model", {}),
+            "quality_role": "budgeted_preview_proxy",
+            "load_priority": 0,
+        },
+        {
+            "id": "raw_model",
+            "role": "canonical_quality_model",
+            "path": str(outputs["raw_model"]),
+            "gaussian_count": pruning_summary.get("raw_gaussian_count") or pruning_summary.get("source_gaussian_count"),
+            "size": sizes.get("raw_model", {}),
+            "quality_role": "full_quality_not_viewer_capped",
+            "load_priority": 1,
+        },
+        {
+            "id": "subject_model",
+            "role": "roi_quality_layer",
+            "path": str(outputs["subject_model"]),
+            "gaussian_count": pruning_summary.get("subject_gaussian_count"),
+            "size": sizes.get("subject_model", {}),
+            "quality_role": "foreground_roi_layer",
+            "load_priority": 2,
+        },
+        {
+            "id": "context_model_lowres",
+            "role": "context_reference",
+            "path": str(outputs["context_model_lowres"]),
+            "gaussian_count": pruning_summary.get("context_gaussian_count"),
+            "size": sizes.get("context_model_lowres", {}),
+            "quality_role": "lowres_context_layer",
+            "load_priority": 3,
+        },
+    ]
+    return {
+        "enabled": enabled,
+        "strategy": "load_viewer_proxy_first_then_full_quality_layers",
+        "preserve_raw_model": layered_config.get("preserve_raw_model", True) is not False,
+        "viewer_is_preview_proxy": layered_config.get("viewer_is_preview_proxy", True) is not False,
+        "quality_ceiling_layer": "raw_model",
+        "interactive_default_layer": "viewer_model",
+        "layers": layers,
+    }
 
 
 def _scale_outlier_cleanup_required(gaussian_quality: dict[str, Any], cleanup_config: dict[str, Any]) -> bool:

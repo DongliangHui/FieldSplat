@@ -8,6 +8,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_permissions
+from app.config import get_settings
 from app.models import Artifact, Project, Workflow
 from app.schemas.artifact import ArtifactListResponse
 from app.schemas.workflow import WorkflowCreated
@@ -101,8 +102,23 @@ def _asset_ids_from_body(body: dict[str, Any]) -> list[str]:
     return list(body.get("asset_ids") or input_json.get("asset_ids") or [])
 
 
+def _optimized_training_requested(config: dict[str, Any]) -> bool:
+    if config.get("execute_training") is not None:
+        return bool(config.get("execute_training"))
+    execution = config.get("execution") if isinstance(config.get("execution"), dict) else {}
+    training = config.get("training") if isinstance(config.get("training"), dict) else {}
+    if "execute_training_by_default" in execution:
+        return bool(execution.get("execute_training_by_default"))
+    if "execute_training_by_default" in training:
+        return bool(training.get("execute_training_by_default"))
+    stage_config = (get_settings().engine_config or {}).get("stage_optimized_reconstruction") or {}
+    stage_execution = stage_config.get("execution") if isinstance(stage_config.get("execution"), dict) else {}
+    stage_training = stage_config.get("training") if isinstance(stage_config.get("training"), dict) else {}
+    return bool(stage_execution.get("execute_training_by_default", False) or stage_training.get("execute_training_by_default", False))
+
+
 def _optimized_queue(config: dict[str, Any]) -> str:
-    return "nerfstudio" if config.get("execute_training") else "preprocess"
+    return "nerfstudio" if _optimized_training_requested(config) else "preprocess"
 
 
 def _resolve_start_workflow(db: Session, run_id: str, body: dict[str, Any]) -> Workflow:

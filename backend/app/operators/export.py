@@ -46,7 +46,7 @@ class ReconstructionExportPipelineOperator:
             self.name,
             inputs=[splat_path or "missing_splat", *((scope_outputs or {}).get("cache_inputs") or [])],
             stage_config={"route": route, "quality": quality, "scope_outputs": _scope_cache_payload(scope_outputs)},
-            algorithm_version="export-pipeline-v3",
+            algorithm_version="export-pipeline-v4-raw-viewer-split",
         )
         if cache_entry.hit and cache.restore(cache_entry, workspace_dir):
             scene_manifest_path = workspace_dir / "scene_manifest.json"
@@ -56,6 +56,7 @@ class ReconstructionExportPipelineOperator:
             tileset_path = workspace_dir / "tileset.json"
             spz_path = workspace_dir / "viewer_asset.spz"
             raw_ply_path = workspace_dir / "raw_splat.ply"
+            viewer_source_path = workspace_dir / "viewer_source.ply"
             optimized_candidates = sorted(path for path in workspace_dir.glob("viewer_asset.*") if path.is_file())
             optimized_viewer_path = optimized_candidates[0] if optimized_candidates else workspace_dir / "viewer_asset.ply"
             if scene_manifest_path.exists():
@@ -71,6 +72,7 @@ class ReconstructionExportPipelineOperator:
                     "workspace_dir": workspace_dir,
                     "outputs": {
                     "raw_ply": raw_ply_path,
+                    "viewer_source_ply": viewer_source_path,
                     "optimized_viewer_asset": optimized_viewer_path,
                     "spark_package": spark_path,
                     "supersplat_package": supersplat_path,
@@ -90,17 +92,23 @@ class ReconstructionExportPipelineOperator:
                     "cache_hit": True,
                     "cache_key": cache_entry.cache_key,
                 }
-        publish_source = _viewer_source_path(splat_path, scope_outputs)
+        raw_source = _raw_source_path(splat_path, scope_outputs)
+        viewer_source = _viewer_source_path(splat_path, scope_outputs)
         raw_ply_path = workspace_dir / "raw_splat.ply"
-        if publish_source and publish_source.exists():
-            shutil.copyfile(publish_source, raw_ply_path)
+        if raw_source and raw_source.exists():
+            shutil.copyfile(raw_source, raw_ply_path)
         else:
             raw_ply_path.write_bytes(b"")
+        viewer_source_path = workspace_dir / "viewer_source.ply"
+        if viewer_source and viewer_source.exists():
+            shutil.copyfile(viewer_source, viewer_source_path)
+        else:
+            viewer_source_path.write_bytes(b"")
 
         export_config = settings.engine_config.get("operators", {}).get("export", {}) or {}
-        optimized_viewer_path, optimization = _build_viewer_asset(export_config, raw_ply_path, workspace_dir)
-        spz_path, spz_status = _build_spz_asset(export_config, raw_ply_path, workspace_dir)
-        tileset_path, tileset_status = _build_3d_tiles_splat(export_config, raw_ply_path, workspace_dir, route)
+        optimized_viewer_path, optimization = _build_viewer_asset(export_config, viewer_source_path, workspace_dir)
+        spz_path, spz_status = _build_spz_asset(export_config, viewer_source_path, workspace_dir)
+        tileset_path, tileset_status = _build_3d_tiles_splat(export_config, viewer_source_path, workspace_dir, route)
 
         spark_package = {
             "format": "spark_package",
@@ -109,7 +117,8 @@ class ReconstructionExportPipelineOperator:
             "asset_format": optimized_viewer_path.suffix.lstrip(".") or "unknown",
             "optimization": optimization,
             "spz": spz_status,
-            "raw_ply_is_final_product": False,
+            "raw_ply_is_final_product": True,
+            "viewer_source_layer": _viewer_default(scope_outputs),
             "route": route,
         }
         supersplat_package = {
@@ -118,18 +127,22 @@ class ReconstructionExportPipelineOperator:
             "optimization_status": optimization["status"],
             "optimizer": optimization,
             "spz": spz_status,
-            "raw_ply_is_final_product": False,
+            "raw_ply_is_final_product": True,
+            "viewer_source_layer": _viewer_default(scope_outputs),
         }
         scene_manifest = {
             "workflow_id": workflow.id,
             "project_id": workflow.project_id,
             "route": route,
             "quality": quality,
-            "raw_ply_is_final_product": False,
+            "raw_ply_is_final_product": True,
+            "raw_ply": raw_ply_path.name,
+            "raw_source_layer": _publish_default(scope_outputs),
             "publish_default": _publish_default(scope_outputs),
             "viewer_default": _viewer_default(scope_outputs),
             "publish_requires": ["scene_manifest", "viewer_asset", "diagnostics_bundle"],
             "viewer_asset": optimized_viewer_path.name,
+            "viewer_source_ply": viewer_source_path.name,
             "viewer_asset_optimization": optimization,
             "spz_asset": spz_path.name if spz_path else None,
             "spz_status": spz_status,
@@ -158,6 +171,7 @@ class ReconstructionExportPipelineOperator:
 
         outputs = {
             "raw_ply": raw_ply_path,
+            "viewer_source_ply": viewer_source_path,
             "optimized_viewer_asset": optimized_viewer_path,
             "spark_package": _write_json(workspace_dir / "spark_package.json", spark_package),
             "supersplat_package": _write_json(workspace_dir / "supersplat_package.json", supersplat_package),
@@ -224,14 +238,30 @@ def _viewer_source_path(splat_path: Path | None, scope_outputs: dict[str, Any] |
     return splat_path
 
 
+def _raw_source_path(splat_path: Path | None, scope_outputs: dict[str, Any] | None) -> Path | None:
+    paths = (scope_outputs or {}).get("paths") or {}
+    publish_default = _publish_default(scope_outputs)
+    for key in (publish_default, "raw_model", "model_full", "subject_model"):
+        candidate = paths.get(key)
+        if not candidate:
+            continue
+        path = Path(str(candidate))
+        if path.exists():
+            return path
+    return splat_path
+
+
 def _scene_scope_manifest(scope_outputs: dict[str, Any] | None) -> dict[str, Any]:
     if not scope_outputs:
         return {"enabled": False}
+    report = scope_outputs.get("report_summary") or {}
     return {
         "enabled": True,
         "publish_default": _publish_default(scope_outputs),
         "viewer_default": _viewer_default(scope_outputs),
+        "layered_loading": report.get("layered_loading"),
         "layers": {
+            "raw_model": "canonical_full_quality_model",
             "subject_model": "high_quality_default",
             "viewer_model": "browser_budget_preview",
             "context_model_lowres": "optional_context_reference",
@@ -239,7 +269,7 @@ def _scene_scope_manifest(scope_outputs: dict[str, Any] | None) -> dict[str, Any
         },
         "mask_manifest": str((scope_outputs.get("paths") or {}).get("mask_manifest") or ""),
         "spatial_crop_manifest": str((scope_outputs.get("paths") or {}).get("spatial_crop_manifest") or ""),
-        "gaussian_pruning_report": scope_outputs.get("report_summary") or {},
+        "gaussian_pruning_report": report,
     }
 
 

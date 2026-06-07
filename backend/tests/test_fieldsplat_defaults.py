@@ -17,6 +17,9 @@ from app.operators.colmap import (
 )
 from app.operators.nerfstudio import _eval_metrics_summary, _resolve_iterations
 from app.operators.pose import _attempt_specs
+from app.api.optimized_reconstruction import _optimized_queue
+from app.api.workflows import _workflow_queue
+from app.services.reconstruction_pipeline import OPTIMIZED_RECONSTRUCTION_TYPE, _build_config
 from app.operators.qc.reconstruction_gates import evaluate_holdout_render_gate
 from app.workers.celery_app import celery_app
 
@@ -128,6 +131,20 @@ def test_colmap_imported_match_commands_use_feature_and_match_importers() -> Non
     assert matcher_cmd[matcher_cmd.index("--SiftMatching.use_gpu") + 1] == "0"
 
 
+def test_colmap_sift_matchers_follow_shared_gpu_setting() -> None:
+    for matcher in ["sequential", "vocabtree", "spatial", "exhaustive"]:
+        command = _matcher_command(
+            "colmap",
+            matcher,
+            Path("database.db"),
+            {"sequential_loop_detection": False},
+            attempt_spec={"sequential_overlap": 20},
+            shared={"use_gpu": False},
+        )
+
+        assert command[command.index("--SiftMatching.use_gpu") + 1] == "0"
+
+
 def test_sequential_matcher_does_not_enable_loop_detection_without_vocab_tree() -> None:
     command = _matcher_command(
         "colmap",
@@ -230,6 +247,22 @@ def test_colmap_selects_largest_sparse_component(tmp_path: Path) -> None:
     assert _select_colmap_model_dir(sparse_dir) == large
 
 
+def test_colmap_selects_sparse_component_by_binary_registered_image_count(tmp_path: Path) -> None:
+    sparse_dir = tmp_path / "sparse"
+    file_size_winner = sparse_dir / "0"
+    registered_count_winner = sparse_dir / "1"
+    file_size_winner.mkdir(parents=True)
+    registered_count_winner.mkdir(parents=True)
+    (file_size_winner / "images.bin").write_bytes((3).to_bytes(8, "little") + (b"padding" * 200))
+    (file_size_winner / "points3D.bin").write_bytes((9000).to_bytes(8, "little"))
+    (file_size_winner / "cameras.bin").write_bytes(b"camera" * 200)
+    (registered_count_winner / "images.bin").write_bytes((8).to_bytes(8, "little"))
+    (registered_count_winner / "points3D.bin").write_bytes((100).to_bytes(8, "little"))
+    (registered_count_winner / "cameras.bin").write_bytes(b"cam")
+
+    assert _select_colmap_model_dir(sparse_dir) == registered_count_winner
+
+
 def test_training_iterations_use_fieldsplat_default_baseline() -> None:
     settings = _settings()
 
@@ -237,7 +270,46 @@ def test_training_iterations_use_fieldsplat_default_baseline() -> None:
     assert _resolve_iterations({}, "quick_preview", settings) == 2000
     assert _resolve_iterations({}, "standard", settings) == 10000
     assert _resolve_iterations({}, "high_quality", settings) == 30000
+    assert _resolve_iterations({"iterations": 30000}, "quick_preview", settings) == 30000
     assert _resolve_iterations({"max_iterations": 123}, "high_quality", settings) == 123
+
+
+def test_stage_optimized_defaults_use_real_pose_fallback_and_30k_training() -> None:
+    settings = _settings()
+    stage_config = settings.engine_config["stage_optimized_reconstruction"]
+
+    assert stage_config["execution"]["execute_pose_estimation_by_default"] is True
+    assert stage_config["execution"]["execute_mask_optimization_by_default"] is True
+    assert stage_config["execution"]["execute_training_by_default"] is True
+    assert stage_config["training"]["execute_training_by_default"] is True
+    assert stage_config["training"]["standard_steps"] == 30000
+    assert stage_config["training"]["final_steps"] == 30000
+    assert stage_config["training"]["long_train_steps"] == 60000
+    assert stage_config["real_pose_candidates"] == [
+        "colmap_hybrid",
+        "hloc_lightglue_aliked_fallback",
+        "colmap_exhaustive",
+        "colmap_sequential",
+    ]
+    assert stage_config["real_training_candidates"] == ["splatfacto_long_train", "splatfacto_big", "splatfacto_high_resolution"]
+    assert settings.engine_config["fieldsplat_defaults_v0_1"]["training"]["nerfstudio_splatfacto"]["high_quality"]["use_bilateral_grid"] is True
+    forensic = settings.engine_config["fieldsplat_defaults_v0_1"]["training"]["nerfstudio_splatfacto"]["forensic_max_quality"]
+    assert forensic["max_num_iterations"] == 60000
+    assert forensic["use_absgrad"] is True
+    assert forensic["use_bilateral_grid"] is True
+
+
+def test_stage_optimized_runtime_defaults_request_nerfstudio_queue() -> None:
+    config = _build_config(SimpleNamespace(config_json={}))
+
+    assert config["execute_pose_estimation"] is True
+    assert config["execute_training"] is True
+    assert _optimized_queue({}) == "nerfstudio"
+    assert _optimized_queue({"execute_training": None}) == "nerfstudio"
+    assert _optimized_queue({"execute_training": False}) == "preprocess"
+    assert _workflow_queue(OPTIMIZED_RECONSTRUCTION_TYPE, {}) == "nerfstudio"
+    assert _workflow_queue(OPTIMIZED_RECONSTRUCTION_TYPE, {"execute_training": None}) == "nerfstudio"
+    assert _workflow_queue(OPTIMIZED_RECONSTRUCTION_TYPE, {"execute_training": False}) == "preprocess"
 
 
 def test_pose_quality_gate_uses_v0_1_pass_b_thresholds() -> None:

@@ -126,7 +126,7 @@ class DynamicMaskOperator:
         masks_dir.mkdir(parents=True, exist_ok=True)
         config = workflow.config_json or {}
         operator_config = settings.engine_config.get("operators", {}).get("dynamic_mask", {}) or {}
-        dynamic_classes = config.get("dynamic_classes") or ["person", "vehicle", "leaf", "water", "reflection"]
+        dynamic_classes = config.get("dynamic_classes") or ["person", "vehicle", "leaf", "water"]
         cache_entry = StageCache(settings).entry(
             self.name,
             inputs=[*preprocess.image_paths, {"input_mode": (preprocess.media_metadata or {}).get("input_mode")}],
@@ -147,7 +147,7 @@ class DynamicMaskOperator:
             report = external_report
         else:
             if (preprocess.media_metadata or {}).get("input_mode") != "video":
-                report = _build_image_collection_dynamic_mask_report(workflow, preprocess, dynamic_classes)
+                report = _build_image_collection_dynamic_mask_report(workflow, preprocess, dynamic_classes, masks_dir, operator_config)
                 if external_unavailable_report:
                     report["external_semantic_mask"] = external_unavailable_report
                 report.update({"cache_hit": False, "cache_key": cache_entry.cache_key})
@@ -169,7 +169,12 @@ def _build_image_collection_dynamic_mask_report(
     workflow: Workflow,
     preprocess: "PreprocessRunResult",
     dynamic_classes: list[str],
+    masks_dir: Path,
+    operator_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    operator_config = operator_config or {}
+    if _requests_reflection_sensitive_mask(dynamic_classes):
+        return _build_reflection_sensitive_image_collection_report(workflow, preprocess, dynamic_classes, masks_dir, operator_config)
     return {
         "workflow_id": workflow.id,
         "operator": DynamicMaskOperator.name,
@@ -187,6 +192,114 @@ def _build_image_collection_dynamic_mask_report(
             "Frame differencing is not valid for unordered or wide-baseline photo collections because camera motion dominates pixel differences.",
         ],
     }
+
+
+def _requests_reflection_sensitive_mask(dynamic_classes: list[str]) -> bool:
+    requested = {str(item).strip().lower() for item in dynamic_classes}
+    return bool(requested.intersection({"reflection", "mirror", "glass", "screen", "tv"}))
+
+
+def _build_reflection_sensitive_image_collection_report(
+    workflow: Workflow,
+    preprocess: "PreprocessRunResult",
+    dynamic_classes: list[str],
+    masks_dir: Path,
+    operator_config: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        import cv2  # type: ignore
+        import numpy as np  # type: ignore
+    except Exception:
+        return {
+            "workflow_id": workflow.id,
+            "operator": DynamicMaskOperator.name,
+            "passed": False,
+            "hard_fail": False,
+            "dynamic_ratio": 0.0,
+            "masked_frame_count": 0,
+            "evaluated_frame_count": len(preprocess.image_paths),
+            "dynamic_classes": dynamic_classes,
+            "policy": "static_3dgs_must_not_explain_reflection_or_screen_artifacts",
+            "implementation": "reflection_heuristic_unavailable",
+            "reason": "opencv_or_numpy_unavailable_for_reflection_mask",
+            "images": [],
+        }
+
+    max_images = int(operator_config.get("reflection_heuristic_max_images") or 0)
+    image_paths = list(preprocess.image_paths[:max_images] if max_images > 0 else preprocess.image_paths)
+    max_ratio = float(operator_config.get("reflection_heuristic_max_coverage_ratio") or operator_config.get("max_dynamic_ratio") or 0.30)
+    dark_value_threshold = int(operator_config.get("reflection_dark_value_threshold") or 28)
+    specular_value_threshold = int(operator_config.get("reflection_specular_value_threshold") or 246)
+    specular_sat_threshold = int(operator_config.get("reflection_specular_saturation_threshold") or 80)
+    masks_dir.mkdir(parents=True, exist_ok=True)
+    entries: list[dict[str, Any]] = []
+    ratios: list[float] = []
+    failed_decode_count = 0
+    for image_path in image_paths:
+        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if image is None:
+            failed_decode_count += 1
+            continue
+        height, width = image.shape[:2]
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        value = hsv[:, :, 2]
+        saturation = hsv[:, :, 1]
+        lap_abs = np.absolute(cv2.Laplacian(gray, cv2.CV_16S))
+        dark_smooth = ((value <= dark_value_threshold) & (lap_abs <= 18)).astype(np.uint8) * 255
+        specular = ((value >= specular_value_threshold) & (saturation <= specular_sat_threshold)).astype(np.uint8) * 255
+        kernel = np.ones((5, 5), dtype=np.uint8)
+        dark_smooth = cv2.morphologyEx(dark_smooth, cv2.MORPH_OPEN, kernel)
+        dark_smooth = cv2.morphologyEx(dark_smooth, cv2.MORPH_CLOSE, kernel)
+        specular = cv2.dilate(specular, np.ones((3, 3), dtype=np.uint8), iterations=1)
+        mask = cv2.bitwise_or(_large_component_mask(dark_smooth, min_area=max(64, int(width * height * 0.001))), specular)
+        coverage = float((mask > 0).mean())
+        if coverage > max_ratio:
+            mask = specular
+            coverage = float((mask > 0).mean())
+        mask_path = masks_dir / f"{image_path.stem}.png"
+        cv2.imwrite(str(mask_path), mask)
+        ratios.append(coverage)
+        entries.append(
+            {
+                "image_name": image_path.name,
+                "mask_path": str(mask_path),
+                "foreground_ratio": round(coverage, 6),
+                "method": "dark_smooth_region_plus_specular_highlight_heuristic",
+            }
+        )
+
+    dynamic_ratio = sum(ratios) / max(len(ratios), 1)
+    return {
+        "workflow_id": workflow.id,
+        "operator": DynamicMaskOperator.name,
+        "passed": dynamic_ratio <= max_ratio,
+        "hard_fail": dynamic_ratio > max_ratio,
+        "dynamic_ratio": round(dynamic_ratio, 6),
+        "max_dynamic_ratio": max_ratio,
+        "masked_frame_count": sum(1 for ratio in ratios if ratio > 0.0),
+        "evaluated_frame_count": len(image_paths),
+        "failed_decode_count": failed_decode_count,
+        "dynamic_classes": dynamic_classes,
+        "policy": "static_3dgs_must_not_explain_reflection_or_screen_artifacts",
+        "implementation": "reflection_heuristic_mask",
+        "method": "dark_smooth_region_plus_specular_highlight_heuristic",
+        "mask_format": "png_full_resolution_binary",
+        "masks_dir": str(masks_dir),
+        "images": entries,
+    }
+
+
+def _large_component_mask(mask: Any, *, min_area: int) -> Any:
+    import cv2  # type: ignore
+    import numpy as np  # type: ignore
+
+    labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    filtered = np.zeros_like(mask)
+    for label in range(1, labels_count):
+        if int(stats[label, cv2.CC_STAT_AREA]) >= min_area:
+            filtered[labels == label] = 255
+    return filtered
 
 
 def _run_configured_dynamic_mask_command(
@@ -214,6 +327,7 @@ def _run_configured_dynamic_mask_command(
     dynamic_prompt = ". ".join(str(item).strip().lower() for item in (workflow.config_json or {}).get("dynamic_classes") or ["person", "vehicle", "leaf", "water", "reflection"] if str(item).strip())
     if dynamic_prompt and not dynamic_prompt.endswith("."):
         dynamic_prompt += "."
+    workflow_config = workflow.config_json or {}
     values = {
         **semantic_values,
         "images_dir": str(preprocess.images_dir),
@@ -222,8 +336,8 @@ def _run_configured_dynamic_mask_command(
         "masks_dir": str(masks_dir),
         "output_report": str(workspace_dir / "dynamic_object_report.external.json"),
         "dynamic_prompt": dynamic_prompt,
-        "max_images": str(int(operator_config.get("semantic_max_images") or 120)),
-        "max_dynamic_ratio": str(operator_config.get("max_dynamic_ratio") or 0.35),
+        "max_images": str(int(workflow_config.get("dynamic_mask_semantic_max_images") or workflow_config.get("semantic_mask_max_images") or operator_config.get("semantic_max_images") or 120)),
+        "max_dynamic_ratio": str(workflow_config.get("dynamic_mask_max_dynamic_ratio") or operator_config.get("max_dynamic_ratio") or 0.35),
         "box_threshold": str(operator_config.get("box_threshold") or semantic_values.get("box_threshold") or 0.3),
         "text_threshold": str(operator_config.get("text_threshold") or semantic_values.get("text_threshold") or 0.25),
     }
@@ -528,7 +642,7 @@ class DatasetPreprocessOperator:
             asset_type_summary[asset.asset_type] = asset_type_summary.get(asset.asset_type, 0) + 1
 
         global_assets = list(routing.global_inputs)
-        if not global_assets and routing.route_key == "instantsplatpp_sparse_local":
+        if not global_assets and routing.route_key in {"colmap_splatfacto", "instantsplatpp_sparse_local"}:
             global_assets = [asset for asset in routing.detail_inputs if _is_image_like(asset)]
 
         cache = StageCache(self.settings)

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from conftest import TEST_ROOT
+from app.operators.qc.reconstruction_gates import evaluate_measurement_gate
 from app.operators.pose import _attempt_stop_policy_accepts
-from app.services.stage_optimizer import StageOptimizer, _score_pose_metrics
+from app.operators.preprocess import _build_image_collection_dynamic_mask_report
+from app.services.reconstruction_pipeline import _stage_measurement_readiness
+from app.services.stage_optimizer import DEFAULT_PRODUCTION_ROUTE_PRESET, ROUTE_PRESETS, StageOptimizer, TrainingInputOptimizationStage, _preprocess_from_dataset_manifest, _score_pose_metrics
 
 
 def _project(client, auth_headers, name: str = "Stage optimal") -> str:
@@ -79,6 +84,63 @@ def test_colmap_attempt_stop_policy_accepts_only_production_quality_pose() -> No
     assert not _attempt_stop_policy_accepts(weak, policy)
 
 
+def test_stage_optimized_route_preset_catalog_has_single_production_route() -> None:
+    assert DEFAULT_PRODUCTION_ROUTE_PRESET == "safe_pose_original_train"
+    assert set(ROUTE_PRESETS) == {"safe_pose_original_train"}
+    assert ROUTE_PRESETS["safe_pose_original_train"]["pose_source"] == "safe_enhanced"
+    assert ROUTE_PRESETS["safe_pose_original_train"]["training_source"] == "original"
+    assert ROUTE_PRESETS["safe_pose_original_train"]["training_supervision_modified"] is False
+
+
+def test_stage_optimized_quality_a_without_scale_is_not_measurement_allowed() -> None:
+    gate = evaluate_measurement_gate(scale_input_count=0, pose_quality={"passed": True}, visual_quality_level="A", mode="standard")
+
+    assert gate["visual_quality_level"] == "A"
+    assert gate["measurement_allowed"] is False
+    assert gate["measurement_mode"] == "disabled"
+    assert gate["scale_source"] == "none"
+    assert "missing_scale_constraint" in gate["issues"]
+
+
+def test_stage_optimized_measurement_requires_scale_source() -> None:
+    scale_asset = type("AssetRef", (), {"asset_type": "scale_marker", "role": "scale_marker"})()
+
+    no_scale = _stage_measurement_readiness(assets=[], final_results={}, quality_level="A", mode="standard")
+    with_scale = _stage_measurement_readiness(assets=[scale_asset], final_results={}, quality_level="A", mode="standard")
+
+    assert no_scale["measurement_allowed"] is False
+    assert no_scale["scale_source"] == "none"
+    assert "missing_scale_constraint" in no_scale["issues"]
+    assert with_scale["measurement_allowed"] is True
+    assert with_scale["scale_source"] == "scale_marker"
+
+
+def test_standard_and_stage_optimized_measurement_gate_consistent() -> None:
+    standard_gate = evaluate_measurement_gate(scale_input_count=0, pose_quality={"passed": True}, visual_quality_level="A", mode="standard")
+    stage_gate = _stage_measurement_readiness(assets=[], final_results={}, quality_level="A", mode="standard")
+
+    assert stage_gate["measurement_allowed"] == standard_gate["measurement_allowed"]
+    assert stage_gate["scale_source"] == standard_gate["scale_source"]
+    assert stage_gate["measurement_mode"] == standard_gate["measurement_mode"]
+    assert stage_gate["issues"] == standard_gate["issues"]
+
+
+def test_measurement_gate_may_allow_approximate_when_scale_source_and_uncertainty_pass() -> None:
+    gate = evaluate_measurement_gate(
+        scale_input_count=1,
+        pose_quality={"passed": True},
+        visual_quality_level="A",
+        scale_uncertainty=0.01,
+        surface_model_available=False,
+        mode="standard",
+    )
+
+    assert gate["measurement_allowed"] is True
+    assert gate["measurement_mode"] == "approximate"
+    assert gate["coordinate_type"] == "scaled"
+    assert gate["scale_source"] == "scale_marker"
+
+
 def _write_grid_image(path: Path, width: int = 1280, height: int = 960) -> None:
     from PIL import Image, ImageDraw
 
@@ -104,6 +166,138 @@ def _register_images(client, auth_headers, project_id: str, name: str = "stage_o
     )
     assert response.status_code == 201
     return [item["asset_id"] for item in response.json()["assets"]]
+
+
+def test_preprocess_from_dataset_manifest_rebuilds_output_without_duplicate_suffixes(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source_images = []
+    for index in range(3):
+        image_path = source_dir / f"image_{index:03d}.jpg"
+        _write_grid_image(image_path, width=320, height=240)
+        source_images.append(str(image_path))
+
+    run_dir = tmp_path / "run"
+    output_dir = run_dir / "stages" / "pose_estimation_optimization" / "candidate" / "input"
+    context = SimpleNamespace(run_dir=run_dir, config={}, run_id="wf_test", project_id="project_test", assets=[])
+    manifest = {"pose_images": source_images, "training_images": source_images, "entries": []}
+
+    first = _preprocess_from_dataset_manifest(context, manifest, output_dir, route_id="route", route_key="route_key")
+    second = _preprocess_from_dataset_manifest(context, manifest, output_dir, route_id="route", route_key="route_key")
+
+    image_names = sorted(path.name for path in second.images_dir.glob("*.jpg"))
+    assert len(first.image_paths) == 3
+    assert len(second.image_paths) == 3
+    assert image_names == ["00001_image_000.jpg", "00002_image_001.jpg", "00003_image_002.jpg"]
+
+
+def test_training_input_materializes_pose_dataset_images_from_transforms(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    pose_dataset = run_dir / "stages" / "pose_estimation_optimization" / "pose_candidates" / "rig" / "rig_lift_dataset"
+    pose_image = pose_dataset / "images" / "00001_view.jpg"
+    pose_image.parent.mkdir(parents=True)
+    _write_grid_image(pose_image, width=320, height=240)
+    transforms_path = pose_dataset / "transforms.json"
+    transforms_path.write_text('{"frames":[{"file_path":"images/00001_view.jpg","transform_matrix":[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]}]}', encoding="utf-8")
+
+    output_dir = run_dir / "stages" / "training_input_optimization" / "training_inputs" / "original_training_images"
+    context = SimpleNamespace(run_dir=run_dir, config={}, run_id="wf_test", project_id="project_test", assets=[])
+    candidate = {"analysis": {"pose": {"dataset_dir": str(pose_dataset), "transforms_path": str(transforms_path)}}}
+    manifest = {"training_images": [str(pose_image)], "pose_images": [str(pose_image)]}
+
+    result = TrainingInputOptimizationStage()._materialize_nerfstudio_training_dataset(context, candidate, manifest, output_dir)
+
+    copied_image = Path(result["dataset_dir"]) / "images" / "00001_view.jpg"
+    assert Path(result["transforms_path"]).exists()
+    assert copied_image.exists()
+
+
+def test_training_input_attaches_inverted_semantic_masks_to_nerfstudio_transforms(tmp_path: Path) -> None:
+    from PIL import Image, ImageDraw
+
+    run_dir = tmp_path / "run"
+    pose_dataset = run_dir / "stages" / "pose_estimation_optimization" / "pose_candidates" / "rig" / "rig_lift_dataset"
+    pose_image = pose_dataset / "images" / "00001_view.jpg"
+    pose_image.parent.mkdir(parents=True)
+    _write_grid_image(pose_image, width=32, height=24)
+    transforms_path = pose_dataset / "transforms.json"
+    transforms_path.write_text('{"frames":[{"file_path":"images/00001_view.jpg","transform_matrix":[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]}]}', encoding="utf-8")
+
+    source_mask = tmp_path / "semantic_masks" / "view.png"
+    source_mask.parent.mkdir()
+    mask = Image.new("L", (32, 24), 0)
+    ImageDraw.Draw(mask).rectangle((4, 4, 12, 12), fill=255)
+    mask.save(source_mask)
+
+    output_dir = run_dir / "stages" / "training_input_optimization" / "training_inputs" / "original_training_images"
+    context = SimpleNamespace(run_dir=run_dir, config={}, run_id="wf_test", project_id="project_test", assets=[])
+    candidate = {
+        "analysis": {
+            "pose": {"dataset_dir": str(pose_dataset), "transforms_path": str(transforms_path)},
+            "mask": {
+                "candidate_name": "human_vehicle_animal_mask",
+                "metrics": {
+                    "operator_report": {
+                        "images": [{"image_name": "00099_view.jpg", "mask_path": str(source_mask), "foreground_ratio": 0.1}]
+                    }
+                },
+            },
+        }
+    }
+    manifest = {"training_images": [str(pose_image)], "pose_images": [str(pose_image)]}
+
+    result = TrainingInputOptimizationStage()._materialize_nerfstudio_training_dataset(context, candidate, manifest, output_dir)
+
+    transforms = json.loads(Path(result["transforms_path"]).read_text(encoding="utf-8"))
+    mask_path = Path(result["dataset_dir"]) / transforms["frames"][0]["mask_path"]
+    assert mask_path.exists()
+    with Image.open(mask_path) as training_mask:
+        assert training_mask.getpixel((6, 6)) == 0
+        assert training_mask.getpixel((20, 20)) == 255
+
+
+def test_training_input_prefers_mask_safe_when_safe_mask_selected(tmp_path: Path) -> None:
+    class Context(SimpleNamespace):
+        def stage_dir(self, stage_name: str) -> Path:
+            return self.run_dir / "stages" / stage_name
+
+    context = Context(run_dir=tmp_path / "run", config={}, run_id="wf_test", project_id="project_test")
+    analysis = {"mask": {"candidate_name": "reflection_sensitive_mask", "metrics": {"forensic_risk_score": 0.05}}}
+    candidates = [
+        {"candidate_name": "original_training_images", "status": "succeeded", "score": 0.9, "analysis": analysis},
+        {"candidate_name": "mask_safe_training_input", "status": "succeeded", "score": 0.7, "analysis": analysis},
+    ]
+
+    best = TrainingInputOptimizationStage().select_best(context, candidates)
+
+    assert best["candidate_name"] == "mask_safe_training_input"
+    assert (context.stage_dir("training_input_optimization") / "best_training_input_selection.json").exists()
+
+
+def test_reflection_sensitive_image_collection_mask_writes_png_manifest(tmp_path: Path) -> None:
+    from PIL import Image, ImageDraw
+
+    image_path = tmp_path / "view.jpg"
+    image = Image.new("RGB", (160, 120), (135, 135, 135))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((20, 20, 90, 70), fill=(5, 5, 5))
+    draw.rectangle((35, 30, 48, 42), fill=(255, 255, 255))
+    image.save(image_path, quality=95)
+    workflow = SimpleNamespace(id="wf_test")
+    preprocess = SimpleNamespace(image_paths=[image_path])
+
+    report = _build_image_collection_dynamic_mask_report(
+        workflow,
+        preprocess,
+        ["reflection", "screen"],
+        tmp_path / "masks",
+        {"reflection_heuristic_max_coverage_ratio": 0.30},
+    )
+
+    assert report["implementation"] == "reflection_heuristic_mask"
+    assert report["images"]
+    assert report["images"][0]["foreground_ratio"] > 0
+    assert Path(report["images"][0]["mask_path"]).exists()
 
 
 def _write_motion_video(path: Path, width: int = 320, height: int = 240, fps: int = 12, frames: int = 48) -> None:
@@ -142,6 +336,36 @@ def _register_video(
     return [item["asset_id"] for item in response.json()["assets"]]
 
 
+def _write_equirectangular_panorama(path: Path, width: int = 1024, height: int = 512) -> None:
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (width, height), (118, 126, 132))
+    draw = ImageDraw.Draw(image)
+    for x in range(0, width, 64):
+        color = (240, 240, 240) if (x // 64) % 2 == 0 else (34, 38, 42)
+        draw.line((x, 0, x, height), fill=color, width=3)
+    for y in range(0, height, 64):
+        draw.line((0, y, width, y), fill=(30, 170, 150), width=2)
+    for index, x0 in enumerate(range(0, width, width // 4)):
+        draw.rectangle((x0 + 24, height // 3, x0 + width // 8, height // 3 + 90), outline=(220, 80 + index * 30, 70), width=8)
+        draw.line((x0 + 16, height // 2, x0 + width // 4 - 16, height // 2 + 80), fill=(250, 230, 80), width=5)
+    image.save(path, quality=96)
+
+
+def _register_panorama(client, auth_headers, project_id: str, name: str = "stage_optimal_panorama", count: int = 1) -> list[str]:
+    import_dir = TEST_ROOT / "imports" / name
+    import_dir.mkdir(parents=True, exist_ok=True)
+    for index in range(count):
+        _write_equirectangular_panorama(import_dir / f"pano_{index:03d}.jpg")
+    response = client.post(
+        f"/api/v1/projects/{project_id}/assets/register",
+        headers=auth_headers,
+        json={"path": str(import_dir), "asset_type": "pano_360", "role": "pano_anchor", "recursive": False},
+    )
+    assert response.status_code == 201
+    return [item["asset_id"] for item in response.json()["assets"]]
+
+
 def test_stage_optimized_reconstruction_records_stages_candidates_and_artifacts(client, auth_headers) -> None:
     project_id = _project(client, auth_headers)
     asset_ids = _register_images(client, auth_headers, project_id)
@@ -166,6 +390,9 @@ def test_stage_optimized_reconstruction_records_stages_candidates_and_artifacts(
     status_payload = status_response.json()
     assert status_payload["workflow_type"] == "stage_optimized_reconstruction"
     assert status_payload["status"] in {"completed", "completed_with_warnings"}
+    assert status_payload["quality"]["measurement_allowed"] is False
+    assert status_payload["quality"]["measurement_readiness"]["scale_source"] == "none"
+    assert "missing_scale_constraint" in status_payload["quality"]["measurement_readiness"]["issues"]
 
     stages_response = client.get(f"/api/v1/runs/{workflow_id}/optimized-reconstruction/stages", headers=auth_headers)
     assert stages_response.status_code == 200
@@ -194,8 +421,6 @@ def test_stage_optimized_reconstruction_records_stages_candidates_and_artifacts(
         "jpg_video_fused_sparse",
         "panorama_context_added",
         "high_confidence_only",
-        "enhanced_pose_original_texture",
-        "enhanced_pose_enhanced_texture",
     }.issubset(candidate_names)
     assert {
         "colmap_exhaustive",
@@ -238,41 +463,89 @@ def test_stage_optimized_reconstruction_records_stages_candidates_and_artifacts(
 
     artifacts_response = client.get(f"/api/v1/runs/{workflow_id}/optimized-reconstruction/final-artifacts", headers=auth_headers)
     assert artifacts_response.status_code == 200
-    artifact_types = {artifact["artifact_type"] for artifact in artifacts_response.json()["artifacts"]}
+    artifacts = artifacts_response.json()["artifacts"]
+    artifact_types = {artifact["artifact_type"] for artifact in artifacts}
     assert {"best_route_report", "all_stage_report", "source_map"}.issubset(artifact_types)
-
-
-def test_stage_optimized_reconstruction_can_force_original_images(client, auth_headers) -> None:
-    import json
-
-    project_id = _project(client, auth_headers, "Original-only stage optimal")
-    asset_ids = _register_images(client, auth_headers, project_id, name="stage_original_only_images", count=4)
-
-    started = client.post(
-        f"/api/v1/runs/{project_id}_original_only/optimized-reconstruction/start",
-        headers=auth_headers,
-        json={
-            "project_id": project_id,
-            "asset_ids": asset_ids,
-            "fake_runner": True,
-            "force_original_images": True,
-            "allow_denoise": True,
-            "allow_deblur": True,
-        },
-    )
-
-    assert started.status_code == 202
-    workflow_id = started.json()["workflow_id"]
-    image_stage = client.get(f"/api/v1/runs/{workflow_id}/optimized-reconstruction/stages/image_enhancement", headers=auth_headers).json()
-    best_path = Path(image_stage["stage_result"]["best_artifact"])
-    image_selection = json.loads(best_path.read_text(encoding="utf-8"))
-
-    assert image_selection["images"]
-    for item in image_selection["images"]:
-        assert item["pose_candidate"] == "original"
-        assert item["training_candidate"] == "original"
-        assert item["image_for_pose"] == item["image_original"]
-        assert item["image_for_training"] == item["image_original"]
+    expected_v3_artifact_types = {
+        "input_route_report",
+        "experimental_route_report",
+        "pose_candidates_report",
+        "metadata_manifest",
+        "metadata_lineage_report",
+        "exif_report",
+        "exif_gps_report",
+        "gps_prior_report",
+        "timestamp_lineage",
+        "camera_model_policy",
+        "camera_model_policy_report",
+        "asset_quality_summary",
+        "image_set_reduction_report",
+        "reflective_transparent_risk_report",
+        "capture_pattern_profile",
+        "reconstruction_readiness_report",
+        "video_probe_report",
+        "scene_segments",
+        "scene_segment_report",
+        "video_frame_selection_report",
+        "frame_selection_report",
+        "frame_graph",
+        "rolling_shutter_risk_report",
+        "hloc_pairs",
+        "feature_match_report",
+        "feature_matching_report",
+        "match_graph",
+        "pose_refinement_report",
+        "scale_alignment_report",
+        "georef_report",
+        "training_view_selection_report",
+        "holdout_view_selection_report",
+        "appearance_group_report",
+        "mask_lineage_report",
+        "mask_visibility_report",
+        "photometric_consistency_report",
+        "training_strategy_report",
+        "panorama_station_manifest",
+        "virtual_camera_manifest",
+        "crop_to_pano_map",
+        "pano_station_graph",
+        "vendor_metadata_report",
+        "drone_capture_profile",
+        "aerial_overlap_report",
+        "flight_strip_report",
+        "gcp_report",
+        "capture_group_manifest",
+        "per_group_pose_report",
+        "global_scene_graph",
+        "cross_group_alignment_report",
+        "manual_control_point_report",
+        "depth_prior_manifest",
+        "normal_prior_manifest",
+        "prior_reliability_report",
+        "depth_sensor_report",
+        "scale_marker_report",
+        "control_point_alignment_report",
+        "scale_uncertainty_report",
+        "measurement_readiness_report",
+        "measurement_confidence_report",
+        "mesh_extraction_report",
+        "scene_partition",
+        "block_training_manifest",
+        "lod_manifest",
+        "chunk_manifest",
+        "streaming_manifest",
+        "tiles_conversion_report",
+        "viewer_package_manifest",
+        "compression_conversion_report",
+        "spz_export_report",
+        "forensic_manifest",
+    }
+    assert expected_v3_artifact_types.issubset(artifact_types)
+    measurement_report = next(artifact for artifact in artifacts if artifact["artifact_type"] == "measurement_readiness_report")
+    measurement_body = client.get(f"/api/v1/artifacts/{measurement_report['artifact_id']}/preview", headers=auth_headers).json()
+    assert measurement_body["schema"] == "fieldsplat.measurement_readiness_report.v1"
+    assert measurement_body["status"] == "succeeded"
+    assert measurement_body["lineage"]["source_asset_ids"]
+    assert measurement_body["summary"]
 
 
 def test_stage_optimized_default_route_uses_safe_pose_original_training_contract(client, auth_headers) -> None:
@@ -316,59 +589,6 @@ def test_stage_optimized_default_route_uses_safe_pose_original_training_contract
     assert Path(selection["nerfstudio_dataset_dir"]).exists()
     assert training_manifest["training_image_distribution"] == {"original": len(asset_ids)}
     assert all(item["training_source_sha256"] for item in training_manifest["images"])
-
-
-def test_stage_optimized_route_matrix_records_r0_r1_and_comparison(client, auth_headers) -> None:
-    import json
-
-    project_id = _project(client, auth_headers, "Route matrix R0 R1")
-    asset_ids = _register_images(client, auth_headers, project_id, name="stage_route_matrix_images", count=6)
-
-    started = client.post(
-        f"/api/v1/runs/{project_id}/optimized-reconstruction/start",
-        headers=auth_headers,
-        json={
-            "asset_ids": asset_ids,
-            "fake_runner": True,
-            "execute_route_matrix": True,
-            "allow_big_model": False,
-            "allow_splatfacto_w": False,
-            "allow_super_resolution": False,
-            "route_matrix": {
-                "default_routes": [
-                    "original_pose_original_train",
-                    "safe_pose_original_train",
-                ]
-            },
-        },
-    )
-
-    assert started.status_code == 202
-    workflow_id = started.json()["workflow_id"]
-    status_response = client.get(f"/api/v1/runs/{workflow_id}/optimized-reconstruction/status", headers=auth_headers)
-    assert status_response.status_code == 200
-    status = status_response.json()
-    comparison_path = Path(status["route_comparison"])
-    comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
-
-    assert status["route_matrix"] is True
-    assert comparison["baseline_route"] == "original_pose_original_train"
-    assert comparison["candidate_routes"] == ["safe_pose_original_train"]
-    assert comparison["best_route"] in {"original_pose_original_train", "safe_pose_original_train"}
-    assert {"original_pose_original_train", "safe_pose_original_train"}.issubset(comparison["metrics_table"])
-
-    route_root = comparison_path.parent.parent / "routes"
-    assert (route_root / "original_pose_original_train" / "stages" / "final_artifact_selection" / "forensic_package_manifest.json").exists()
-    assert (route_root / "safe_pose_original_train" / "stages" / "final_artifact_selection" / "forensic_package_manifest.json").exists()
-
-    records = status["records"]
-    route_stage_records = {
-        (record.get("route_id"), record.get("stage_name"))
-        for record in records["stages"]
-        if record.get("stage_name") == "dataset_assembly"
-    }
-    assert ("original_pose_original_train", "dataset_assembly") in route_stage_records
-    assert ("safe_pose_original_train", "dataset_assembly") in route_stage_records
 
 
 def test_stage_optimized_reconstruction_requires_explicit_asset_ids(client, auth_headers) -> None:
@@ -422,6 +642,65 @@ def test_stage_optimized_reconstruction_video_keyframe_stage_reuses_sample_pool(
         "hybrid_sparse",
         "loop_aware",
     }.issubset(video_candidate_names)
+
+
+def test_static_panorama_uses_perspective_projection_and_source_mapping(client, auth_headers) -> None:
+    import json
+
+    from PIL import Image
+
+    project_id = _project(client, auth_headers, "Static panorama projection")
+    asset_ids = _register_panorama(client, auth_headers, project_id, name="stage_static_panorama_projection")
+
+    started = client.post(
+        f"/api/v1/runs/{project_id}/optimized-reconstruction/start",
+        headers=auth_headers,
+        json={
+            "asset_ids": asset_ids,
+            "fake_runner": True,
+            "active_route_preset": "panorama_context_added",
+            "panorama_normalization_routes": ["perspective_cubemap_4"],
+            "panorama": {"output_size": 512},
+        },
+    )
+    assert started.status_code == 202
+    workflow_id = started.json()["workflow_id"]
+
+    pano_stage = client.get(f"/api/v1/runs/{workflow_id}/optimized-reconstruction/stages/panorama_normalization", headers=auth_headers).json()
+    pano_candidate_names = {str(candidate["candidate_name"]) for candidate in pano_stage["candidate_metrics"]}
+    assert not any(name.endswith(":perspective_cubemap_6") for name in pano_candidate_names)
+    perspective_candidate = next(candidate for candidate in pano_stage["candidate_metrics"] if str(candidate["candidate_name"]).endswith(":perspective_cubemap_4"))
+    mapping = json.loads(Path(perspective_candidate["output_path"]).read_text(encoding="utf-8"))
+    views = mapping["views"]
+
+    assert len(views) == 4
+    assert {view["mapping"] for view in views} == {"equirectangular_to_perspective"}
+    assert {view["source_type"] for view in views} == {"panorama_station_view"}
+    assert all(view["asset_id"] == asset_ids[0] for view in views)
+    assert all(view["source_image_path"] for view in views)
+    assert all(view["source_pano_id"] == asset_ids[0] for view in views)
+    assert all(view["shared_center_group"] == asset_ids[0] for view in views)
+    with Image.open(views[0]["image_path"]) as projected:
+        assert projected.size == (512, 512)
+
+    dataset_stage = client.get(f"/api/v1/runs/{workflow_id}/optimized-reconstruction/stages/dataset_assembly", headers=auth_headers).json()
+    panorama_candidate = next(candidate for candidate in dataset_stage["candidate_metrics"] if candidate["candidate_name"] == "panorama_context_added")
+    manifest = json.loads(Path(panorama_candidate["output_path"]).read_text(encoding="utf-8"))
+    pano_entries = [entry for entry in manifest["entries"] if entry["source_type"] == "panorama_station_view"]
+
+    assert len(pano_entries) == 4
+    assert manifest["metrics"]["static_panorama_view_count"] == 4
+    assert manifest["metrics"]["spherical_rig_view_count"] == 4
+    assert manifest["metrics"]["raw_equirectangular_keyframe_count"] == 0
+    assert all(entry["asset_id"] == asset_ids[0] for entry in pano_entries)
+    assert all(entry["source_image_path"] for entry in pano_entries)
+    assert all(entry["source_pano_id"] == asset_ids[0] for entry in pano_entries)
+    assert all(entry["shared_center_group"] == asset_ids[0] for entry in pano_entries)
+
+    source_map = json.loads(Path(panorama_candidate["source_map_path"]).read_text(encoding="utf-8"))
+    pano_sources = [item for item in source_map["sources"] if item.get("source_pano_id") == asset_ids[0]]
+    assert len(pano_sources) == 4
+    assert all(item["source_image_path"] for item in pano_sources)
 
 
 def test_experimental_360_video_route_is_opt_in_and_keeps_default_video_path(client, auth_headers) -> None:

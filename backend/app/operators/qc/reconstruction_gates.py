@@ -137,14 +137,40 @@ def evaluate_dynamic_mask_gate(dynamic_report: dict[str, Any], *, scene_profile:
     }
 
 
-def evaluate_measurement_gate(*, scale_input_count: int, pose_quality: dict[str, Any], mode: str = "standard") -> dict[str, Any]:
+def evaluate_measurement_gate(
+    *,
+    scale_input_count: int,
+    pose_quality: dict[str, Any],
+    mode: str = "standard",
+    visual_quality_level: str | None = None,
+    scale_source: str | None = None,
+    scale_uncertainty: float | None = None,
+    georeferenced: bool = False,
+    surface_model_available: bool = False,
+) -> dict[str, Any]:
     issues: list[str] = []
     min_markers = default_int("measurement_gate.scale_marker.min_markers", 1)
     max_scale_error_ratio = default_float("measurement_gate.scale_marker.max_scale_error_ratio", 0.03)
+    resolved_scale_source = scale_source or ("scale_marker" if scale_input_count >= min_markers else "none")
     if scale_input_count < min_markers:
         issues.append("missing_scale_constraint")
     if not pose_quality.get("passed", False):
         issues.append("pose_quality_not_trusted")
+    if scale_uncertainty is not None and scale_uncertainty > max_scale_error_ratio:
+        issues.append("scale_uncertainty_too_high")
+    measurement_allowed = not issues
+    if not measurement_allowed:
+        measurement_mode = "disabled"
+        measurement_confidence = "low"
+        coordinate_type = "arbitrary"
+    elif georeferenced and surface_model_available:
+        measurement_mode = "measurement_grade"
+        measurement_confidence = "high"
+        coordinate_type = "measurement_grade"
+    else:
+        measurement_mode = "approximate"
+        measurement_confidence = "medium"
+        coordinate_type = "georeferenced" if georeferenced else "scaled"
     return {
         "passed": not issues,
         "hard_fail": False,
@@ -152,8 +178,22 @@ def evaluate_measurement_gate(*, scale_input_count: int, pose_quality: dict[str,
         "scale_input_count": scale_input_count,
         "min_scale_markers": min_markers,
         "max_scale_error_ratio": max_scale_error_ratio,
-        "measurement_allowed": not issues,
+        "measurement_allowed": measurement_allowed,
+        "measurement_confidence": measurement_confidence,
+        "coordinate_type": coordinate_type,
+        "scale_source": resolved_scale_source,
+        "scale_uncertainty": scale_uncertainty,
+        "georeferenced": georeferenced,
+        "surface_model_available": surface_model_available,
+        "visual_quality_level": visual_quality_level,
+        "measurement_mode": measurement_mode,
+        "warning": None
+        if measurement_allowed
+        else "Current reconstruction is visual-only until a trusted scale source and pose quality pass the measurement gate.",
+        "message": None
+        if measurement_allowed
+        else "Current reconstruction is for visualization and review, not precise measurement.",
         "quality_grade_if_passed": "A",
         "quality_grade_if_failed": "B",
-        "basis": "A-grade requires reliable scale constraints and passing pose quality",
+        "basis": "Measurement readiness requires reliable scale constraints and passing pose quality; visual quality alone is insufficient",
     }
